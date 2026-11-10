@@ -36,6 +36,8 @@
 
 set -Eeuo pipefail
 
+SCRIPT_VERSION="8 (2026-11-10)"
+
 # ----------------------------- 可調參數 --------------------------------------
 DOMAIN="${DOMAIN:-}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-}"
@@ -98,6 +100,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 ###############################################################################
 step "1/10 前置檢查"
 ###############################################################################
+log "install_glpi12.sh 版本 ${SCRIPT_VERSION},共 10 個步驟,依序完整執行"
 # shellcheck disable=SC1091
 . /etc/os-release
 if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "24.04" ]]; then
@@ -501,10 +504,11 @@ server {
 }
 
 server {
-    # Ubuntu 24.04 的 Nginx 為 1.24,使用 "listen ... http2" 寫法
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    # nginx >= 1.25.1 使用獨立的 http2 指令,舊版則寫在 listen 後面 (由腳本依版本代換)
+    listen 443 ssl@HTTP2_LISTEN@;
+    listen [::]:443 ssl@HTTP2_LISTEN@;
     server_name @DOMAIN@;
+    @HTTP2_DIRECTIVE@
 
     ssl_certificate     @CERT@;
     ssl_certificate_key @KEY@;
@@ -524,7 +528,14 @@ server {
 }
 EOF
     fi
-    sed -i "s#@DOMAIN@#${DOMAIN}#g; s#@CERT@#${cert:-}#g; s#@KEY@#${key:-}#g" "$SITE_FILE"
+    local ngx_ver h2l h2d
+    ngx_ver="$(nginx -v 2>&1 | sed -E 's#.*/([0-9.]+).*#\1#')"
+    if dpkg --compare-versions "${ngx_ver:-0}" ge 1.25.1; then
+        h2l=""; h2d="http2 on;"
+    else
+        h2l=" http2"; h2d=""
+    fi
+    sed -i "s#@DOMAIN@#${DOMAIN}#g; s#@CERT@#${cert:-}#g; s#@KEY@#${key:-}#g; s#@HTTP2_LISTEN@#${h2l}#g; s#@HTTP2_DIRECTIVE@#${h2d}#g" "$SITE_FILE"
     if [[ "$SITE_MODE" == "sites-enabled" ]]; then
         ln -sf "$SITE_FILE" /etc/nginx/sites-enabled/glpi
         rm -f /etc/nginx/sites-enabled/default
@@ -553,6 +564,14 @@ case "$TLS_MODE" in
         ;;
     selfsigned)
         mkdir -p /etc/ssl/glpi
+        # 既有憑證的 SAN 若不含目前的 DOMAIN (例如先前輸入錯誤的 IP),就重新產生
+        if [[ -f /etc/ssl/glpi/glpi.crt ]] \
+           && ! openssl x509 -in /etc/ssl/glpi/glpi.crt -noout -ext subjectAltName 2>/dev/null \
+                | grep -qE "(IP Address|DNS):${DOMAIN//./\\.}([,[:space:]]|$)"; then
+            warn "既有自簽憑證與 ${DOMAIN} 不符,舊憑證改名為 .old 並重新產生"
+            mv /etc/ssl/glpi/glpi.crt "/etc/ssl/glpi/glpi.crt.old.$(date +%s)"
+            mv /etc/ssl/glpi/glpi.key "/etc/ssl/glpi/glpi.key.old.$(date +%s)" 2>/dev/null || true
+        fi
         if [[ ! -f /etc/ssl/glpi/glpi.crt ]]; then
             if is_ip "$DOMAIN"; then SAN="IP:${DOMAIN}"; else SAN="DNS:${DOMAIN}"; fi
             openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 825 \
@@ -707,6 +726,12 @@ SQL
 
 else
     warn "非全新安裝,略過預設帳號處理與資料庫設定寫入 (保留既有設定)"
+    CUR_URL="$(rootdb -N "$DB_NAME" -e "SELECT value FROM glpi_configs WHERE context='core' AND name='url_base';" 2>/dev/null || true)"
+    if [[ "$CUR_URL" != "${SCHEME}://${DOMAIN}" ]]; then
+        warn "GLPI 目前的 url_base 是 '${CUR_URL:-未設定}',與這次的 ${SCHEME}://${DOMAIN} 不同。"
+        warn "若 ${SCHEME}://${DOMAIN} 才是正確位址,請執行:"
+        warn "  mariadb -uroot -p ${DB_NAME} -e \"UPDATE glpi_configs SET value='${SCHEME}://${DOMAIN}' WHERE context='core' AND name='url_base';\""
+    fi
 fi
 
 # --- 排程 (GLPI 自動動作) ---
@@ -733,21 +758,38 @@ if [[ "$INSTALL_BACKUP" == "1" ]]; then
 [client]
 user=${DB_USER}
 password=${DB_PASSWORD}
+default-character-set=utf8mb4
 EOF
     umask 022
     cat > /usr/local/sbin/glpi-backup.sh <<'EOF'
 #!/usr/bin/env bash
 # 每日備份 GLPI 資料庫與設定/檔案,保留 14 天。
 # 注意: 備份放在同一台主機不算真正的備份,請另外同步到其他主機或儲存空間。
+# 備份先寫成 .partial,驗證通過才改名;任何一步失敗都會清掉殘檔,
+# 避免留下「看起來像備份、其實是空的」檔案。
 set -euo pipefail
+umask 077
+
 BACKUP_DIR="@BACKUP_DIR@"
 DATE="$(date +%Y%m%d_%H%M%S)"
 DUMP="$(command -v mariadb-dump || command -v mysqldump)"
+DB_OUT="${BACKUP_DIR}/glpi-db-${DATE}.sql.gz"
+FILES_OUT="${BACKUP_DIR}/glpi-files-${DATE}.tar.gz"
+trap 'rm -f "${DB_OUT}.partial" "${FILES_OUT}.partial"' EXIT
 
-"$DUMP" --defaults-extra-file=/root/.glpi-backup.cnf --single-transaction --quick --routines --events "@DB_NAME@" | gzip > "${BACKUP_DIR}/glpi-db-${DATE}.sql.gz"
-tar -czf "${BACKUP_DIR}/glpi-files-${DATE}.tar.gz" \
+# 用 --defaults-file (只讀這一個檔案),不能用 --defaults-extra-file:
+# 後者排在 ~/.my.cnf 之前讀取,會被 /root/.my.cnf 裡過期的 root 認證蓋掉
+"$DUMP" --defaults-file=/root/.glpi-backup.cnf --single-transaction --quick --routines --events "@DB_NAME@" \
+    | gzip > "${DB_OUT}.partial"
+gzip -t "${DB_OUT}.partial"
+[[ "$(stat -c%s "${DB_OUT}.partial")" -gt 1000 ]] || { echo "資料庫備份異常偏小,視為失敗" >&2; exit 1; }
+mv "${DB_OUT}.partial" "$DB_OUT"
+
+tar -czf "${FILES_OUT}.partial" \
     --exclude='*/_cache' --exclude='*/_sessions' --exclude='*/_tmp' \
     "@CONFIG_DIR@" "@VAR_DIR@" @SITE_FILE@ /etc/nginx/snippets/glpi-app.conf
+mv "${FILES_OUT}.partial" "$FILES_OUT"
+
 find "$BACKUP_DIR" -type f -mtime +14 -delete
 EOF
     sed -i "s#@BACKUP_DIR@#${BACKUP_DIR}#g; s#@DB_NAME@#${DB_NAME}#g; s#@CONFIG_DIR@#${CONFIG_DIR}#g; s#@VAR_DIR@#${VAR_DIR}#g; s#@SITE_FILE@#${SITE_FILE}#g" /usr/local/sbin/glpi-backup.sh
