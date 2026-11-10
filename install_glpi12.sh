@@ -388,9 +388,37 @@ step "5/10 安裝並設定 Nginx"
 ###############################################################################
 apt_install nginx >/dev/null
 systemctl enable --now nginx
-# Ubuntu 內建 Nginx 以 www-data 執行,才能讀取 PHP-FPM socket (www-data:www-data)
-grep -Eq '^\s*user\s+www-data' /etc/nginx/nginx.conf \
-    || warn "Nginx 執行身分不是 www-data (是否裝過 nginx.org 版本?),PHP-FPM socket 可能無法存取"
+log "Nginx 版本: $(nginx -v 2>&1 | sed 's#.*/##')"
+
+# (a) Nginx 必須以 www-data 執行,才能讀取 PHP-FPM socket (www-data:www-data 0660)。
+#     Ubuntu 內建版預設就是 www-data;nginx.org 版預設是 nginx,需要改掉。
+NGINX_USER="$(awk '$1=="user"{gsub(/;/,"",$2); print $2; exit}' /etc/nginx/nginx.conf)"
+if [[ "${NGINX_USER:-}" != "www-data" ]]; then
+    warn "Nginx 以 '${NGINX_USER:-未設定}' 身分執行,改為 www-data 以便存取 PHP-FPM socket"
+    if grep -Eq '^[[:space:]]*user[[:space:]]+[^;]+;' /etc/nginx/nginx.conf; then
+        sed -i -E '0,/^[[:space:]]*user[[:space:]]+[^;]+;/s//user www-data;/' /etc/nginx/nginx.conf
+    else
+        sed -i '1i user www-data;' /etc/nginx/nginx.conf
+    fi
+    systemctl restart nginx    # user 變更需要重啟才會確實套用
+fi
+
+# (b) 判斷站台設定該放哪裡:
+#     Ubuntu 內建版會載入 sites-enabled/;nginx.org 版只載入 conf.d/*.conf,
+#     若照 sites-enabled 放,設定會被完全忽略 (443 不會出現)。
+if grep -Eq 'include[[:space:]]+/etc/nginx/sites-enabled/' /etc/nginx/nginx.conf; then
+    SITE_MODE="sites-enabled"
+    SITE_FILE="/etc/nginx/sites-available/glpi"
+else
+    SITE_MODE="conf.d"
+    SITE_FILE="/etc/nginx/conf.d/glpi.conf"
+    warn "nginx.conf 不載入 sites-enabled (可能是 nginx.org 版本),站台設定改寫入 ${SITE_FILE}"
+    # 停用預設歡迎頁,避免它佔用 80 port 的 default_server
+    [[ -f /etc/nginx/conf.d/default.conf ]] && mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled
+    # 清掉先前腳本留下、但不會被載入的連結
+    rm -f /etc/nginx/sites-enabled/glpi
+fi
+log "Nginx 站台設定模式: ${SITE_MODE} (${SITE_FILE})"
 
 mkdir -p /var/www/letsencrypt /etc/nginx/snippets
 
@@ -438,7 +466,7 @@ write_nginx_site() {
 
     if [[ "$mode" == "http" ]]; then
         # 純 HTTP: 申請憑證前的暫時設定,或 TLS_MODE=none 的正式設定
-        cat > /etc/nginx/sites-available/glpi <<'EOF'
+        cat > "$SITE_FILE" <<'EOF'
 server {
     listen 80;
     listen [::]:80;
@@ -456,7 +484,7 @@ server {
 }
 EOF
     else
-        cat > /etc/nginx/sites-available/glpi <<'EOF'
+        cat > "$SITE_FILE" <<'EOF'
 server {
     listen 80;
     listen [::]:80;
@@ -496,9 +524,11 @@ server {
 }
 EOF
     fi
-    sed -i "s#@DOMAIN@#${DOMAIN}#g; s#@CERT@#${cert:-}#g; s#@KEY@#${key:-}#g" /etc/nginx/sites-available/glpi
-    ln -sf /etc/nginx/sites-available/glpi /etc/nginx/sites-enabled/glpi
-    rm -f /etc/nginx/sites-enabled/default
+    sed -i "s#@DOMAIN@#${DOMAIN}#g; s#@CERT@#${cert:-}#g; s#@KEY@#${key:-}#g" "$SITE_FILE"
+    if [[ "$SITE_MODE" == "sites-enabled" ]]; then
+        ln -sf "$SITE_FILE" /etc/nginx/sites-enabled/glpi
+        rm -f /etc/nginx/sites-enabled/default
+    fi
     nginx -t
     systemctl reload nginx 2>/dev/null || systemctl restart nginx
 }
@@ -717,10 +747,10 @@ DUMP="$(command -v mariadb-dump || command -v mysqldump)"
 "$DUMP" --defaults-extra-file=/root/.glpi-backup.cnf --single-transaction --quick --routines --events "@DB_NAME@" | gzip > "${BACKUP_DIR}/glpi-db-${DATE}.sql.gz"
 tar -czf "${BACKUP_DIR}/glpi-files-${DATE}.tar.gz" \
     --exclude='*/_cache' --exclude='*/_sessions' --exclude='*/_tmp' \
-    "@CONFIG_DIR@" "@VAR_DIR@" /etc/nginx/sites-available/glpi /etc/nginx/snippets/glpi-app.conf
+    "@CONFIG_DIR@" "@VAR_DIR@" @SITE_FILE@ /etc/nginx/snippets/glpi-app.conf
 find "$BACKUP_DIR" -type f -mtime +14 -delete
 EOF
-    sed -i "s#@BACKUP_DIR@#${BACKUP_DIR}#g; s#@DB_NAME@#${DB_NAME}#g; s#@CONFIG_DIR@#${CONFIG_DIR}#g; s#@VAR_DIR@#${VAR_DIR}#g" /usr/local/sbin/glpi-backup.sh
+    sed -i "s#@BACKUP_DIR@#${BACKUP_DIR}#g; s#@DB_NAME@#${DB_NAME}#g; s#@CONFIG_DIR@#${CONFIG_DIR}#g; s#@VAR_DIR@#${VAR_DIR}#g; s#@SITE_FILE@#${SITE_FILE}#g" /usr/local/sbin/glpi-backup.sh
     chmod 700 /usr/local/sbin/glpi-backup.sh
     echo "30 2 * * * root /usr/local/sbin/glpi-backup.sh >/dev/null 2>&1" > /etc/cron.d/glpi-backup
     chmod 644 /etc/cron.d/glpi-backup
@@ -755,8 +785,13 @@ if [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]]; then
     log "✓ GLPI 網頁回應 HTTP ${HTTP_CODE}"
 else
     warn "GLPI 網頁回應 HTTP ${HTTP_CODE}。以下是自動收集的診斷資訊:"
+    echo "--- curl 實際錯誤訊息 (000 可能是被拒絕、逾時或 TLS 失敗,看這裡才分得出來) ---"
+    curl -ksS -o /dev/null --max-time 15 -H "Host: ${DOMAIN}" "${SCHEME}://127.0.0.1/" 2>&1 || true
     echo "--- 80/443 監聽狀態 ---"
     ss -tlnp 2>/dev/null | grep -E ':(80|443)\b' || echo "(沒有任何程序在監聽 80/443)"
+    echo "--- Nginx 版本 / 執行身分 / include 設定 ---"
+    nginx -v 2>&1 || true
+    grep -nE '^[[:space:]]*(user|include)' /etc/nginx/nginx.conf 2>&1 || true
     echo "--- nginx -t ---";                       nginx -t 2>&1 || true
     echo "--- 已啟用的 Nginx 站台 ---";            ls -l /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>&1 || true
     echo "--- nginx journal (最後 15 行) ---";     journalctl -u nginx -n 15 --no-pager 2>&1 || true
