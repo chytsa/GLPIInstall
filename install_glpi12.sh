@@ -192,10 +192,20 @@ step "3/10 安裝並設定 MariaDB"
 apt_install mariadb-server mariadb-client >/dev/null
 
 # --- 讀取或產生密碼 (重複執行時沿用) ---
-DB_PASSWORD=""; GLPI_ADMIN_PASSWORD=""
+# 可由環境變數帶入 (例如帳密檔已被刪除時:DB_PASSWORD=... 重跑);否則讀帳密檔,再不然才產生新的
+DB_PASSWORD="${DB_PASSWORD:-}"; GLPI_ADMIN_PASSWORD="${GLPI_ADMIN_PASSWORD:-}"
 if [[ -f "$CRED_FILE" ]]; then
     # shellcheck disable=SC1090
     source <(grep -E "^(DB_PASSWORD|GLPI_ADMIN_PASSWORD)=" "$CRED_FILE" || true)
+fi
+# GLPI 已安裝、但手上沒有原本的資料庫密碼時,絕對不能產生新密碼:
+# 後面的 ALTER USER 會改掉 MariaDB 裡的密碼,而 config_db.php 內仍是舊的,GLPI 就會連不上資料庫。
+if [[ -z "$DB_PASSWORD" && -f "${CONFIG_DIR}/config_db.php" ]]; then
+    die "GLPI 已安裝 (${CONFIG_DIR}/config_db.php 存在),但找不到原本的資料庫密碼 (${CRED_FILE} 已不存在?)。
+       為避免把資料庫密碼改成與 config_db.php 不一致,腳本已中止。請擇一:
+         a) 把原本的 DB_PASSWORD 放回 ${CRED_FILE};或
+         b) 以環境變數帶入: sudo env DB_PASSWORD='原密碼' ... bash $0
+       原密碼可在 /root/.glpi-backup.cnf (備份用) 或密碼管理器中找到"
 fi
 [[ -n "$DB_PASSWORD" ]]         || DB_PASSWORD="$(gen_pw)"
 [[ -n "$GLPI_ADMIN_PASSWORD" ]] || GLPI_ADMIN_PASSWORD="$(gen_pw)"
