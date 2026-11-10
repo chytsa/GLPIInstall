@@ -27,6 +27,8 @@
 #   ENABLE_UFW        1=設定並啟用 UFW 防火牆         (1)
 #   INSTALL_BACKUP    1=安裝每日備份排程              (1)
 #   FORCE_OS          1=略過 Ubuntu 24.04 檢查        (0)
+#   DB_ROOT_PASSWORD  MariaDB root 密碼 (僅在 root 已被設定為密碼登入時才需要)
+#   FORCE_DB_OVERWRITE 1=允許覆蓋「已有資料表」的資料庫 (會清空該資料庫!) (0)
 #
 # 重複執行是安全的:已存在的帳密會沿用,已安裝的 GLPI 不會被覆蓋。
 # 全部輸出會同時記錄在 /var/log/glpi-install.log
@@ -48,6 +50,8 @@ RELOCATE_DIRS="${RELOCATE_DIRS:-1}"
 ENABLE_UFW="${ENABLE_UFW:-1}"
 INSTALL_BACKUP="${INSTALL_BACKUP:-1}"
 FORCE_OS="${FORCE_OS:-0}"
+DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-}"
+FORCE_DB_OVERWRITE="${FORCE_DB_OVERWRITE:-0}"
 
 # ----------------------------- 固定路徑 --------------------------------------
 GLPI_HOME="/var/www/glpi"
@@ -218,16 +222,49 @@ EOF
 systemctl enable --now mariadb
 systemctl restart mariadb
 
+# >>> root-access
+# 判斷如何以 root 連上 MariaDB。依序嘗試:
+#   1. unix_socket,並忽略 ~/.my.cnf (全新安裝的預設情況;也能避開過期的 my.cnf 密碼)
+#   2. 以 DB_ROOT_PASSWORD 登入 (root 先前已被設為密碼登入)
+#   3. 沿用 ~/.my.cnf / 環境變數中既有的認證
+ROOT_MODE=""
+detect_root_access() {
+    if mariadb --no-defaults -uroot -e "SELECT 1" >/dev/null 2>&1; then
+        ROOT_MODE="socket"
+    elif [[ -n "$DB_ROOT_PASSWORD" ]] && MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb --no-defaults -uroot -e "SELECT 1" >/dev/null 2>&1; then
+        ROOT_MODE="password"
+    elif mariadb -e "SELECT 1" >/dev/null 2>&1; then
+        ROOT_MODE="defaults"
+    else
+        die "無法以 root 連上 MariaDB。這台主機的 MariaDB 先前已被設定過。
+       請擇一處理後重新執行:
+         a) 若知道 root 密碼:  DB_ROOT_PASSWORD='你的密碼' 再執行本腳本
+         b) 若忘記密碼:        參考說明改回 unix_socket 驗證,或在無重要資料時移除 MariaDB 後重裝"
+    fi
+    log "MariaDB root 連線方式: ${ROOT_MODE}"
+}
+rootdb() {
+    case "$ROOT_MODE" in
+        socket)   mariadb --no-defaults -uroot "$@" ;;
+        password) MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb --no-defaults -uroot "$@" ;;
+        defaults) mariadb "$@" ;;
+        *)        die "rootdb 在 detect_root_access 之前被呼叫" ;;
+    esac
+}
+# <<< root-access
+
+detect_root_access
+
 # --- 載入時區表 (GLPI 建議) ---
 TZ_TOOL="$(command -v mariadb-tzinfo-to-sql || command -v mysql_tzinfo_to_sql || true)"
 if [[ -n "$TZ_TOOL" ]]; then
-    "$TZ_TOOL" /usr/share/zoneinfo 2>/dev/null | mariadb mysql || warn "時區表載入有警告 (通常可忽略)"
+    "$TZ_TOOL" /usr/share/zoneinfo 2>/dev/null | rootdb mysql || warn "時區表載入有警告 (通常可忽略)"
 else
     warn "找不到 mariadb-tzinfo-to-sql,略過時區表"
 fi
 
-# --- 建立資料庫與使用者 (root 走 unix_socket,不需要密碼) ---
-mariadb <<SQL
+# --- 建立資料庫與使用者 ---
+rootdb <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
 ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
@@ -238,7 +275,7 @@ FLUSH PRIVILEGES;
 SQL
 
 # 驗證應用程式帳號可以登入
-mariadb -u"$DB_USER" -p"$DB_PASSWORD" -h localhost "$DB_NAME" -e "SELECT 1;" >/dev/null \
+mariadb --no-defaults -u"$DB_USER" -p"$DB_PASSWORD" -h localhost "$DB_NAME" -e "SELECT 1;" >/dev/null \
     || die "資料庫帳號 ${DB_USER} 登入失敗"
 log "✓ MariaDB 就緒 (buffer pool ${BP_MB}M)"
 
@@ -569,6 +606,13 @@ if [[ -f "${CONFIG_DIR}/config_db.php" ]]; then
     warn "config_db.php 已存在,略過 db:install"
 else
     FRESH_INSTALL=1
+    # db:install 使用 --force 會覆蓋既有資料表,所以資料庫內已有資料時先中止,避免誤刪
+    EXISTING_TABLES="$(rootdb -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}';" 2>/dev/null || echo 0)"
+    if [[ "${EXISTING_TABLES:-0}" -gt 0 && "$FORCE_DB_OVERWRITE" != "1" ]]; then
+        die "資料庫 '${DB_NAME}' 內已有 ${EXISTING_TABLES} 個資料表,執行 db:install 會將其清空。
+       - 若確定可以覆蓋 (例如之前失敗的安裝殘留): 加上 FORCE_DB_OVERWRITE=1 重新執行
+       - 若裡面有需要保留的資料: 請改用 DB_NAME=其他名稱 重新執行,或先備份"
+    fi
     log "執行 db:install (資料表建立約需 1-2 分鐘)"
     as_www php bin/console db:install \
         --db-host=localhost \
@@ -592,14 +636,14 @@ step "9/10 安裝後設定 (帳號、庫存、排程、備份)"
 if [[ "$FRESH_INSTALL" == "1" ]]; then
     # --- 預設帳號處理: 為 glpi 設定強密碼,其餘預設帳號停用並隨機化密碼 ---
     ADMIN_HASH="$(PW="$GLPI_ADMIN_PASSWORD" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
-    if mariadb "$DB_NAME" <<SQL
+    if rootdb "$DB_NAME" <<SQL
 UPDATE glpi_users SET password='${ADMIN_HASH}' WHERE name='glpi';
 UPDATE glpi_users SET is_active=0 WHERE name IN ('tech','normal','post-only');
 SQL
     then
         for u in tech normal post-only; do
             H="$(PW="$(gen_pw)" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
-            mariadb "$DB_NAME" -e "UPDATE glpi_users SET password='${H}' WHERE name='${u}';" || true
+            rootdb "$DB_NAME" -e "UPDATE glpi_users SET password='${H}' WHERE name='${u}';" || true
         done
         log "✓ 預設帳號已處理 (glpi 密碼見 ${CRED_FILE};tech / normal / post-only 已停用)"
     else
@@ -607,7 +651,7 @@ SQL
     fi
 
     # --- 啟用庫存功能 (否則 GLPI Agent 傳來的資料會被拒收) 與 URL ---
-    mariadb "$DB_NAME" <<SQL || warn "寫入設定失敗,請在介面中確認「管理 > 庫存 > 啟用庫存」"
+    rootdb "$DB_NAME" <<SQL || warn "寫入設定失敗,請在介面中確認「管理 > 庫存 > 啟用庫存」"
 INSERT INTO glpi_configs (context, name, value) VALUES ('inventory','enable_inventory','1')
 ON DUPLICATE KEY UPDATE value='1';
 INSERT INTO glpi_configs (context, name, value) VALUES ('core','url_base','${SCHEME}://${DOMAIN}')
@@ -629,7 +673,7 @@ echo "* * * * * www-data ${CRON_CMD} >/dev/null 2>&1" > /etc/cron.d/glpi
 chmod 644 /etc/cron.d/glpi
 # 將自動動作切換為 CLI 模式 (mode 2),由系統 cron 執行
 if [[ "$FRESH_INSTALL" == "1" ]]; then
-    mariadb "$DB_NAME" -e "UPDATE glpi_crontasks SET mode=2 WHERE mode=1;" \
+    rootdb "$DB_NAME" -e "UPDATE glpi_crontasks SET mode=2 WHERE mode=1;" \
         || warn "切換自動動作為 CLI 模式失敗,請在「設定 > 自動動作」手動調整"
 fi
 log "✓ 已建立 /etc/cron.d/glpi"
@@ -637,6 +681,14 @@ log "✓ 已建立 /etc/cron.d/glpi"
 # --- 每日備份 ---
 if [[ "$INSTALL_BACKUP" == "1" ]]; then
     mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+    # 備份使用 glpi 應用程式帳號,避免依賴 root 的驗證方式 (socket 或密碼皆可)
+    umask 077
+    cat > /root/.glpi-backup.cnf <<EOF
+[client]
+user=${DB_USER}
+password=${DB_PASSWORD}
+EOF
+    umask 022
     cat > /usr/local/sbin/glpi-backup.sh <<'EOF'
 #!/usr/bin/env bash
 # 每日備份 GLPI 資料庫與設定/檔案,保留 14 天。
@@ -646,7 +698,7 @@ BACKUP_DIR="@BACKUP_DIR@"
 DATE="$(date +%Y%m%d_%H%M%S)"
 DUMP="$(command -v mariadb-dump || command -v mysqldump)"
 
-"$DUMP" --single-transaction --quick --routines --events "@DB_NAME@" | gzip > "${BACKUP_DIR}/glpi-db-${DATE}.sql.gz"
+"$DUMP" --defaults-extra-file=/root/.glpi-backup.cnf --single-transaction --quick --routines --events "@DB_NAME@" | gzip > "${BACKUP_DIR}/glpi-db-${DATE}.sql.gz"
 tar -czf "${BACKUP_DIR}/glpi-files-${DATE}.tar.gz" \
     --exclude='*/_cache' --exclude='*/_sessions' --exclude='*/_tmp' \
     "@CONFIG_DIR@" "@VAR_DIR@" /etc/nginx/sites-available/glpi /etc/nginx/snippets/glpi-app.conf
