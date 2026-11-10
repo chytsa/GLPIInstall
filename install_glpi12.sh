@@ -84,7 +84,7 @@ as_www() { sudo -u www-data -H "$@"; }
 
 is_ip() { [[ "$1" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; }
 
-gen_pw() { openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-24; }
+gen_pw() { openssl rand -base64 48 | tr -d '/+=\n' | cut -c1-24; }
 
 [[ $EUID -eq 0 ]] || die "請以 root 執行 (sudo bash $0)"
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -107,6 +107,11 @@ apt_install curl ca-certificates openssl >/dev/null
 
 [[ -n "$DOMAIN" ]] || DOMAIN="$(hostname -I | awk '{print $1}')"
 [[ -n "$DOMAIN" ]] || die "無法判斷 DOMAIN,請以 DOMAIN=... 指定"
+# DOMAIN 會被寫進 Nginx 設定、sed 與 SQL,所以限制為合法的主機名稱或 IPv4
+[[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
+    || die "DOMAIN 格式不合法: '$DOMAIN' (只允許英數字、點、連字號)"
+[[ "$DB_NAME" =~ ^[A-Za-z0-9_-]+$ ]] || die "DB_NAME 只允許英數字、底線、連字號"
+[[ "$DB_USER" =~ ^[A-Za-z0-9_]+$ ]]  || die "DB_USER 只允許英數字、底線"
 if [[ "$TLS_MODE" == "letsencrypt" ]]; then
     [[ -n "$ADMIN_EMAIL" ]] || die "TLS_MODE=letsencrypt 需要設定 ADMIN_EMAIL"
     is_ip "$DOMAIN" && die "Let's Encrypt 不能用 IP 位址,請改用網域名稱,或改 TLS_MODE=selfsigned"
@@ -329,7 +334,10 @@ log "✓ PHP-FPM 就緒 (max_children=${MAX_CH})"
 step "5/10 安裝並設定 Nginx"
 ###############################################################################
 apt_install nginx >/dev/null
-systemctl enable nginx
+systemctl enable --now nginx
+# Ubuntu 內建 Nginx 以 www-data 執行,才能讀取 PHP-FPM socket (www-data:www-data)
+grep -Eq '^\s*user\s+www-data' /etc/nginx/nginx.conf \
+    || warn "Nginx 執行身分不是 www-data (是否裝過 nginx.org 版本?),PHP-FPM socket 可能無法存取"
 
 mkdir -p /var/www/letsencrypt /etc/nginx/snippets
 
@@ -443,7 +451,6 @@ EOF
 }
 
 write_nginx_site http
-systemctl restart nginx
 log "✓ Nginx (HTTP) 就緒"
 
 ###############################################################################
@@ -557,9 +564,11 @@ log "檢查 GLPI 需求"
 as_www php bin/console system:check_requirements \
     || die "GLPI 需求檢查未通過,請依上方訊息補齊 (例如缺少的 PHP 擴充),再重新執行腳本"
 
+FRESH_INSTALL=0
 if [[ -f "${CONFIG_DIR}/config_db.php" ]]; then
     warn "config_db.php 已存在,略過 db:install"
 else
+    FRESH_INSTALL=1
     log "執行 db:install (資料表建立約需 1-2 分鐘)"
     as_www php bin/console db:install \
         --db-host=localhost \
@@ -578,30 +587,37 @@ as_www php bin/console database:enable_timezones || warn "啟用時區支援失�
 ###############################################################################
 step "9/10 安裝後設定 (帳號、庫存、排程、備份)"
 ###############################################################################
-# --- 預設帳號處理: 為 glpi 設定強密碼,其餘預設帳號停用並隨機化密碼 ---
-ADMIN_HASH="$(PW="$GLPI_ADMIN_PASSWORD" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
-if mariadb "$DB_NAME" <<SQL
+# 以下會直接改寫資料庫內容,只在「本次全新安裝」時執行,
+# 避免重跑腳本時覆蓋管理員已在介面中改過的密碼與設定。
+if [[ "$FRESH_INSTALL" == "1" ]]; then
+    # --- 預設帳號處理: 為 glpi 設定強密碼,其餘預設帳號停用並隨機化密碼 ---
+    ADMIN_HASH="$(PW="$GLPI_ADMIN_PASSWORD" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
+    if mariadb "$DB_NAME" <<SQL
 UPDATE glpi_users SET password='${ADMIN_HASH}' WHERE name='glpi';
 UPDATE glpi_users SET is_active=0 WHERE name IN ('tech','normal','post-only');
 SQL
-then
-    for u in tech normal post-only; do
-        H="$(PW="$(gen_pw)" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
-        mariadb "$DB_NAME" -e "UPDATE glpi_users SET password='${H}' WHERE name='${u}';" || true
-    done
-    log "✓ 預設帳號已處理 (glpi 密碼見 ${CRED_FILE};tech / normal / post-only 已停用)"
-else
-    warn "預設帳號處理失敗,請登入後立即手動修改 glpi / tech / normal / post-only 的密碼 (預設與帳號同名)"
-fi
+    then
+        for u in tech normal post-only; do
+            H="$(PW="$(gen_pw)" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
+            mariadb "$DB_NAME" -e "UPDATE glpi_users SET password='${H}' WHERE name='${u}';" || true
+        done
+        log "✓ 預設帳號已處理 (glpi 密碼見 ${CRED_FILE};tech / normal / post-only 已停用)"
+    else
+        warn "預設帳號處理失敗,請登入後立即手動修改 glpi / tech / normal / post-only 的密碼 (預設與帳號同名)"
+    fi
 
-# --- 啟用庫存功能 (否則 GLPI Agent 傳來的資料會被拒收) 與 URL ---
-mariadb "$DB_NAME" <<SQL || warn "寫入設定失敗,請在介面中確認「管理 > 庫存 > 啟用庫存」"
+    # --- 啟用庫存功能 (否則 GLPI Agent 傳來的資料會被拒收) 與 URL ---
+    mariadb "$DB_NAME" <<SQL || warn "寫入設定失敗,請在介面中確認「管理 > 庫存 > 啟用庫存」"
 INSERT INTO glpi_configs (context, name, value) VALUES ('inventory','enable_inventory','1')
-  ON DUPLICATE KEY UPDATE value='1';
+ON DUPLICATE KEY UPDATE value='1';
 INSERT INTO glpi_configs (context, name, value) VALUES ('core','url_base','${SCHEME}://${DOMAIN}')
-  ON DUPLICATE KEY UPDATE value='${SCHEME}://${DOMAIN}';
+ON DUPLICATE KEY UPDATE value='${SCHEME}://${DOMAIN}';
 SQL
-log "✓ 已啟用庫存功能並設定 URL: ${SCHEME}://${DOMAIN}"
+    log "✓ 已啟用庫存功能並設定 URL: ${SCHEME}://${DOMAIN}"
+
+else
+    warn "非全新安裝,略過預設帳號處理與資料庫設定寫入 (保留既有設定)"
+fi
 
 # --- 排程 (GLPI 自動動作) ---
 if [[ -f "${GLPI_HOME}/front/cron.php" ]]; then
@@ -612,8 +628,10 @@ fi
 echo "* * * * * www-data ${CRON_CMD} >/dev/null 2>&1" > /etc/cron.d/glpi
 chmod 644 /etc/cron.d/glpi
 # 將自動動作切換為 CLI 模式 (mode 2),由系統 cron 執行
-mariadb "$DB_NAME" -e "UPDATE glpi_crontasks SET mode=2 WHERE mode=1;" \
-    || warn "切換自動動作為 CLI 模式失敗,請在「設定 > 自動動作」手動調整"
+if [[ "$FRESH_INSTALL" == "1" ]]; then
+    mariadb "$DB_NAME" -e "UPDATE glpi_crontasks SET mode=2 WHERE mode=1;" \
+        || warn "切換自動動作為 CLI 模式失敗,請在「設定 > 自動動作」手動調整"
+fi
 log "✓ 已建立 /etc/cron.d/glpi"
 
 # --- 每日備份 ---
