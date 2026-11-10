@@ -734,11 +734,37 @@ for svc in nginx "php${PHP_VER}-fpm" mariadb; do
     systemctl is-active --quiet "$svc" && log "✓ $svc 運行中" || warn "✗ $svc 未運行"
 done
 
-HTTP_CODE="$(curl -ksS -o /dev/null -w '%{http_code}' -H "Host: ${DOMAIN}" "${SCHEME}://127.0.0.1/" || echo 000)"
+probe_web() {
+    # curl 失敗時 -w 仍會輸出 000,所以這裡用 || true,避免重複附加造成 "000000"
+    curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 \
+        -H "Host: ${DOMAIN}" "${SCHEME}://127.0.0.1/" 2>/dev/null || true
+}
+HTTP_CODE="$(probe_web)"; HTTP_CODE="${HTTP_CODE:-000}"
+
+# 000 = 連線被拒或逾時,常見原因是 Nginx 先前的 reload 沒有套用新設定,先完整重啟再驗證一次
+if [[ "$HTTP_CODE" == "000" ]]; then
+    warn "${SCHEME}://127.0.0.1 連線失敗,嘗試完整重啟 Nginx 後再驗證"
+    systemctl restart nginx || true
+    sleep 2
+    HTTP_CODE="$(probe_web)"; HTTP_CODE="${HTTP_CODE:-000}"
+    [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]] \
+        && warn "重啟後恢復正常:表示先前 reload 沒有套用新設定,建議查看 journalctl -u nginx 找原因"
+fi
+
 if [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]]; then
     log "✓ GLPI 網頁回應 HTTP ${HTTP_CODE}"
 else
-    warn "GLPI 網頁回應 HTTP ${HTTP_CODE},請檢查: tail -50 /var/log/nginx/glpi_error.log  /  ${LOG_DIR}/php-errors.log"
+    warn "GLPI 網頁回應 HTTP ${HTTP_CODE}。以下是自動收集的診斷資訊:"
+    echo "--- 80/443 監聽狀態 ---"
+    ss -tlnp 2>/dev/null | grep -E ':(80|443)\b' || echo "(沒有任何程序在監聽 80/443)"
+    echo "--- nginx -t ---";                       nginx -t 2>&1 || true
+    echo "--- 已啟用的 Nginx 站台 ---";            ls -l /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>&1 || true
+    echo "--- nginx journal (最後 15 行) ---";     journalctl -u nginx -n 15 --no-pager 2>&1 || true
+    echo "--- /var/log/nginx/error.log (最後 15 行) ---"; tail -n 15 /var/log/nginx/error.log 2>&1 || true
+    echo "--- glpi_error.log (最後 15 行) ---";    tail -n 15 /var/log/nginx/glpi_error.log 2>&1 || true
+    echo "--- PHP-FPM socket 與 journal ---";      ls -l /run/php/ 2>&1 || true
+    journalctl -u "php${PHP_VER}-fpm" -n 10 --no-pager 2>&1 || true
+    echo "--- GLPI php-errors.log (最後 15 行) ---"; tail -n 15 "${LOG_DIR}/php-errors.log" 2>&1 || true
 fi
 
 cat <<EOF
