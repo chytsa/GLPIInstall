@@ -59,6 +59,7 @@ GLPI_URL="https://github.com/glpi-project/glpi/releases/download/${GLPI_VERSION}
 CRED_FILE="/root/glpi-credentials.txt"
 LOG_FILE="/var/log/glpi-install.log"
 PHP_SOCK="/run/php/php${PHP_VER}-fpm-glpi.sock"
+PHP_BIN="/usr/bin/php${PHP_VER}"
 BACKUP_DIR="/var/backups/glpi"
 
 if [[ "$RELOCATE_DIRS" == "1" ]]; then
@@ -156,15 +157,28 @@ if [[ -z "$(swapon --show --noheadings)" ]] && (( MEM_MB < 4096 )); then
 fi
 
 if [[ "$ENABLE_UFW" == "1" ]]; then
-    SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
-    SSH_PORT="${SSH_PORT:-22}"
+    # 收集 SSH 埠。任何一個來源失敗都不能讓腳本中止 (set -o pipefail 下尤其要注意),
+    # 且寧可多開不要漏開,否則啟用防火牆後會把自己鎖在外面。
+    SSH_PORTS=()
+    add_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && SSH_PORTS+=("$1") || true; }
+    # (a) 目前這個 SSH 連線實際使用的埠 (格式: 用戶端IP 用戶端埠 伺服器IP 伺服器埠)
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then add_port "$(awk '{print $4}' <<<"$SSH_CONNECTION")"; fi
+    # (b) sshd 的有效設定 (24.04 socket activation 下 sshd -T 可能失敗,所以容錯)
+    while read -r _p; do add_port "$_p"; done < <(sshd -T 2>/dev/null | awk '/^port /{print $2}' || true)
+    # (c) 設定檔內的 Port 指令
+    while read -r _p; do add_port "$_p"; done < <(grep -hiE '^[[:space:]]*Port[[:space:]]+[0-9]+' \
+        /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' || true)
+    # 都偵測不到才使用預設 22
+    (( ${#SSH_PORTS[@]} > 0 )) || SSH_PORTS=(22)
+    mapfile -t SSH_PORTS < <(printf '%s\n' "${SSH_PORTS[@]}" | sort -un)
+
     ufw default deny incoming
     ufw default allow outgoing
-    ufw allow "${SSH_PORT}/tcp" comment 'SSH'
+    for _p in "${SSH_PORTS[@]}"; do ufw allow "${_p}/tcp" comment 'SSH'; done
     ufw allow 80/tcp comment 'HTTP'
     [[ "$TLS_MODE" == "none" ]] || ufw allow 443/tcp comment 'HTTPS'
     ufw --force enable
-    log "UFW 已啟用 (SSH 埠 ${SSH_PORT}、80$([[ "$TLS_MODE" == "none" ]] || echo '、443'))"
+    log "UFW 已啟用 (SSH 埠 ${SSH_PORTS[*]}、80$([[ "$TLS_MODE" == "none" ]] || echo '、443'))"
 else
     warn "已略過 UFW 設定"
 fi
@@ -361,6 +375,8 @@ cat > /etc/logrotate.d/php-fpm-glpi <<'EOF'
 }
 EOF
 
+[[ -x "$PHP_BIN" ]] || die "找不到 $PHP_BIN,PHP ${PHP_VER} 安裝失敗"
+log "使用 PHP: $("$PHP_BIN" -r 'echo PHP_VERSION;') ($PHP_BIN);系統預設 php 指向: $(readlink -f "$(command -v php 2>/dev/null || echo /dev/null)")"
 php-fpm${PHP_VER} -t
 systemctl enable --now "php${PHP_VER}-fpm"
 systemctl restart "php${PHP_VER}-fpm"
@@ -598,7 +614,7 @@ step "8/10 GLPI 需求檢查與資料庫初始化"
 cd "$GLPI_HOME"
 
 log "檢查 GLPI 需求"
-as_www php bin/console system:check_requirements \
+as_www "$PHP_BIN" bin/console system:check_requirements \
     || die "GLPI 需求檢查未通過,請依上方訊息補齊 (例如缺少的 PHP 擴充),再重新執行腳本"
 
 FRESH_INSTALL=0
@@ -614,7 +630,7 @@ else
        - 若裡面有需要保留的資料: 請改用 DB_NAME=其他名稱 重新執行,或先備份"
     fi
     log "執行 db:install (資料表建立約需 1-2 分鐘)"
-    as_www php bin/console db:install \
+    as_www "$PHP_BIN" bin/console db:install \
         --db-host=localhost \
         --db-name="$DB_NAME" \
         --db-user="$DB_USER" \
@@ -626,7 +642,7 @@ else
        若是目錄搬移 (RELOCATE_DIRS=1) 與此 GLPI 版本不相容,請清理後以 RELOCATE_DIRS=0 重跑"
 fi
 
-as_www php bin/console database:enable_timezones || warn "啟用時區支援失敗,可稍後手動執行: php bin/console database:enable_timezones"
+as_www "$PHP_BIN" bin/console database:enable_timezones || warn "啟用時區支援失敗,可稍後手動執行: ${PHP_BIN} bin/console database:enable_timezones"
 
 ###############################################################################
 step "9/10 安裝後設定 (帳號、庫存、排程、備份)"
@@ -635,14 +651,14 @@ step "9/10 安裝後設定 (帳號、庫存、排程、備份)"
 # 避免重跑腳本時覆蓋管理員已在介面中改過的密碼與設定。
 if [[ "$FRESH_INSTALL" == "1" ]]; then
     # --- 預設帳號處理: 為 glpi 設定強密碼,其餘預設帳號停用並隨機化密碼 ---
-    ADMIN_HASH="$(PW="$GLPI_ADMIN_PASSWORD" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
+    ADMIN_HASH="$(PW="$GLPI_ADMIN_PASSWORD" "$PHP_BIN" -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
     if rootdb "$DB_NAME" <<SQL
 UPDATE glpi_users SET password='${ADMIN_HASH}' WHERE name='glpi';
 UPDATE glpi_users SET is_active=0 WHERE name IN ('tech','normal','post-only');
 SQL
     then
         for u in tech normal post-only; do
-            H="$(PW="$(gen_pw)" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
+            H="$(PW="$(gen_pw)" "$PHP_BIN" -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
             rootdb "$DB_NAME" -e "UPDATE glpi_users SET password='${H}' WHERE name='${u}';" || true
         done
         log "✓ 預設帳號已處理 (glpi 密碼見 ${CRED_FILE};tech / normal / post-only 已停用)"
@@ -665,9 +681,9 @@ fi
 
 # --- 排程 (GLPI 自動動作) ---
 if [[ -f "${GLPI_HOME}/front/cron.php" ]]; then
-    CRON_CMD="/usr/bin/php ${GLPI_HOME}/front/cron.php"
+    CRON_CMD="${PHP_BIN} ${GLPI_HOME}/front/cron.php"
 else
-    CRON_CMD="/usr/bin/php ${GLPI_HOME}/bin/console glpi:cron"
+    CRON_CMD="${PHP_BIN} ${GLPI_HOME}/bin/console glpi:cron"
 fi
 echo "* * * * * www-data ${CRON_CMD} >/dev/null 2>&1" > /etc/cron.d/glpi
 chmod 644 /etc/cron.d/glpi
