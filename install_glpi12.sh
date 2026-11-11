@@ -27,12 +27,17 @@
 #   ENABLE_UFW        1=設定並啟用 UFW 防火牆         (1)
 #   INSTALL_BACKUP    1=安裝每日備份排程              (1)
 #   FORCE_OS          1=略過 Ubuntu 24.04 檢查        (0)
+#   MARIADB_SOURCE    ubuntu=全新安裝時固定使用 Ubuntu 官方來源的 MariaDB;any=不限制 (ubuntu)
+#   DB_ROOT_PASSWORD  MariaDB root 密碼 (僅在 root 已被設定為密碼登入時才需要)
+#   FORCE_DB_OVERWRITE 1=允許覆蓋「已有資料表」的資料庫 (會清空該資料庫!) (0)
 #
 # 重複執行是安全的:已存在的帳密會沿用,已安裝的 GLPI 不會被覆蓋。
 # 全部輸出會同時記錄在 /var/log/glpi-install.log
 ###############################################################################
 
 set -Eeuo pipefail
+
+SCRIPT_VERSION="8 (2026-11-10)"
 
 # ----------------------------- 可調參數 --------------------------------------
 DOMAIN="${DOMAIN:-}"
@@ -48,6 +53,9 @@ RELOCATE_DIRS="${RELOCATE_DIRS:-1}"
 ENABLE_UFW="${ENABLE_UFW:-1}"
 INSTALL_BACKUP="${INSTALL_BACKUP:-1}"
 FORCE_OS="${FORCE_OS:-0}"
+MARIADB_SOURCE="${MARIADB_SOURCE:-ubuntu}"
+DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-}"
+FORCE_DB_OVERWRITE="${FORCE_DB_OVERWRITE:-0}"
 
 # ----------------------------- 固定路徑 --------------------------------------
 GLPI_HOME="/var/www/glpi"
@@ -55,6 +63,7 @@ GLPI_URL="https://github.com/glpi-project/glpi/releases/download/${GLPI_VERSION}
 CRED_FILE="/root/glpi-credentials.txt"
 LOG_FILE="/var/log/glpi-install.log"
 PHP_SOCK="/run/php/php${PHP_VER}-fpm-glpi.sock"
+PHP_BIN="/usr/bin/php${PHP_VER}"
 BACKUP_DIR="/var/backups/glpi"
 
 if [[ "$RELOCATE_DIRS" == "1" ]]; then
@@ -84,7 +93,7 @@ as_www() { sudo -u www-data -H "$@"; }
 
 is_ip() { [[ "$1" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; }
 
-gen_pw() { openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-24; }
+gen_pw() { openssl rand -base64 48 | tr -d '/+=\n' | cut -c1-24; }
 
 [[ $EUID -eq 0 ]] || die "請以 root 執行 (sudo bash $0)"
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -93,6 +102,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 ###############################################################################
 step "1/10 前置檢查"
 ###############################################################################
+log "install_glpi12.sh 版本 ${SCRIPT_VERSION},共 10 個步驟,依序完整執行"
 # shellcheck disable=SC1091
 . /etc/os-release
 if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "24.04" ]]; then
@@ -107,6 +117,11 @@ apt_install curl ca-certificates openssl >/dev/null
 
 [[ -n "$DOMAIN" ]] || DOMAIN="$(hostname -I | awk '{print $1}')"
 [[ -n "$DOMAIN" ]] || die "無法判斷 DOMAIN,請以 DOMAIN=... 指定"
+# DOMAIN 會被寫進 Nginx 設定、sed 與 SQL,所以限制為合法的主機名稱或 IPv4
+[[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
+    || die "DOMAIN 格式不合法: '$DOMAIN' (只允許英數字、點、連字號)"
+[[ "$DB_NAME" =~ ^[A-Za-z0-9_-]+$ ]] || die "DB_NAME 只允許英數字、底線、連字號"
+[[ "$DB_USER" =~ ^[A-Za-z0-9_]+$ ]]  || die "DB_USER 只允許英數字、底線"
 if [[ "$TLS_MODE" == "letsencrypt" ]]; then
     [[ -n "$ADMIN_EMAIL" ]] || die "TLS_MODE=letsencrypt 需要設定 ADMIN_EMAIL"
     is_ip "$DOMAIN" && die "Let's Encrypt 不能用 IP 位址,請改用網域名稱,或改 TLS_MODE=selfsigned"
@@ -147,15 +162,28 @@ if [[ -z "$(swapon --show --noheadings)" ]] && (( MEM_MB < 4096 )); then
 fi
 
 if [[ "$ENABLE_UFW" == "1" ]]; then
-    SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
-    SSH_PORT="${SSH_PORT:-22}"
+    # 收集 SSH 埠。任何一個來源失敗都不能讓腳本中止 (set -o pipefail 下尤其要注意),
+    # 且寧可多開不要漏開,否則啟用防火牆後會把自己鎖在外面。
+    SSH_PORTS=()
+    add_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && SSH_PORTS+=("$1") || true; }
+    # (a) 目前這個 SSH 連線實際使用的埠 (格式: 用戶端IP 用戶端埠 伺服器IP 伺服器埠)
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then add_port "$(awk '{print $4}' <<<"$SSH_CONNECTION")"; fi
+    # (b) sshd 的有效設定 (24.04 socket activation 下 sshd -T 可能失敗,所以容錯)
+    while read -r _p; do add_port "$_p"; done < <(sshd -T 2>/dev/null | awk '/^port /{print $2}' || true)
+    # (c) 設定檔內的 Port 指令
+    while read -r _p; do add_port "$_p"; done < <(grep -hiE '^[[:space:]]*Port[[:space:]]+[0-9]+' \
+        /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' || true)
+    # 都偵測不到才使用預設 22
+    (( ${#SSH_PORTS[@]} > 0 )) || SSH_PORTS=(22)
+    mapfile -t SSH_PORTS < <(printf '%s\n' "${SSH_PORTS[@]}" | sort -un)
+
     ufw default deny incoming
     ufw default allow outgoing
-    ufw allow "${SSH_PORT}/tcp" comment 'SSH'
+    for _p in "${SSH_PORTS[@]}"; do ufw allow "${_p}/tcp" comment 'SSH'; done
     ufw allow 80/tcp comment 'HTTP'
     [[ "$TLS_MODE" == "none" ]] || ufw allow 443/tcp comment 'HTTPS'
     ufw --force enable
-    log "UFW 已啟用 (SSH 埠 ${SSH_PORT}、80$([[ "$TLS_MODE" == "none" ]] || echo '、443'))"
+    log "UFW 已啟用 (SSH 埠 ${SSH_PORTS[*]}、80$([[ "$TLS_MODE" == "none" ]] || echo '、443'))"
 else
     warn "已略過 UFW 設定"
 fi
@@ -163,13 +191,60 @@ fi
 ###############################################################################
 step "3/10 安裝並設定 MariaDB"
 ###############################################################################
-apt_install mariadb-server mariadb-client >/dev/null
+# >>> mariadb-source
+# 只裝 "mariadb-server" 並不保證來自 Ubuntu:系統上若還有第三方 MariaDB 來源 (例如舊指南加的),
+# 且版本比 Ubuntu 新,apt 會選第三方的。所以全新安裝時用 APT pin 固定為 Ubuntu 官方來源 (Origin: Ubuntu)。
+MARIADB_PIN="/etc/apt/preferences.d/99-glpi-mariadb-ubuntu"
+MARIADB_FRESH=0
+if dpkg -s mariadb-server >/dev/null 2>&1; then
+    # 已經裝過:不去變更它 (從第三方降回 Ubuntu 版是降版,有風險),只回報現況
+    _cur="$(dpkg-query -W -f='${Version}' mariadb-server 2>/dev/null || true)"
+    if [[ "$_cur" == *"+maria"* ]]; then
+        warn "已安裝的 MariaDB 是 MariaDB.org 版本 (${_cur}),不是 Ubuntu 內建版;為避免降版風險,腳本不會變更它"
+    else
+        log "MariaDB 已安裝: ${_cur}"
+    fi
+    apt_install mariadb-server mariadb-client >/dev/null
+else
+    MARIADB_FRESH=1
+    if [[ "$MARIADB_SOURCE" == "ubuntu" ]]; then
+        cat > "$MARIADB_PIN" <<'EOF'
+# 由 install_glpi12.sh 產生:MariaDB 相關套件只使用 Ubuntu 官方來源,
+# 即使之後系統上出現第三方來源 (例如 mariadb.org) 也不會被自動換過去。
+# 若日後想改用 MariaDB.org 的版本,請先刪除此檔。
+Package: mariadb-* libmariadb* mysql-common
+Pin: release o=Ubuntu
+Pin-Priority: 1001
+EOF
+        log "已設定 APT pin: MariaDB 套件固定使用 Ubuntu 官方來源 (${MARIADB_PIN})"
+    else
+        warn "MARIADB_SOURCE=${MARIADB_SOURCE}:不限制 MariaDB 套件來源"
+    fi
+    apt_install mariadb-server mariadb-client >/dev/null
+fi
+
+_ver="$(dpkg-query -W -f='${Version}' mariadb-server 2>/dev/null || true)"
+log "MariaDB 套件版本: ${_ver:-未知}"
+if [[ "$MARIADB_FRESH" == "1" && "$MARIADB_SOURCE" == "ubuntu" && "$_ver" == *"+maria"* ]]; then
+    die "裝到的是 MariaDB.org 版本 (${_ver}),不是 Ubuntu 官方來源。請檢查: apt-cache policy mariadb-server"
+fi
+# <<< mariadb-source
 
 # --- 讀取或產生密碼 (重複執行時沿用) ---
-DB_PASSWORD=""; GLPI_ADMIN_PASSWORD=""
+# 可由環境變數帶入 (例如帳密檔已被刪除時:DB_PASSWORD=... 重跑);否則讀帳密檔,再不然才產生新的
+DB_PASSWORD="${DB_PASSWORD:-}"; GLPI_ADMIN_PASSWORD="${GLPI_ADMIN_PASSWORD:-}"
 if [[ -f "$CRED_FILE" ]]; then
     # shellcheck disable=SC1090
     source <(grep -E "^(DB_PASSWORD|GLPI_ADMIN_PASSWORD)=" "$CRED_FILE" || true)
+fi
+# GLPI 已安裝、但手上沒有原本的資料庫密碼時,絕對不能產生新密碼:
+# 後面的 ALTER USER 會改掉 MariaDB 裡的密碼,而 config_db.php 內仍是舊的,GLPI 就會連不上資料庫。
+if [[ -z "$DB_PASSWORD" && -f "${CONFIG_DIR}/config_db.php" ]]; then
+    die "GLPI 已安裝 (${CONFIG_DIR}/config_db.php 存在),但找不到原本的資料庫密碼 (${CRED_FILE} 已不存在?)。
+       為避免把資料庫密碼改成與 config_db.php 不一致,腳本已中止。請擇一:
+         a) 把原本的 DB_PASSWORD 放回 ${CRED_FILE};或
+         b) 以環境變數帶入: sudo env DB_PASSWORD='原密碼' ... bash $0
+       原密碼可在 /root/.glpi-backup.cnf (備份用) 或密碼管理器中找到"
 fi
 [[ -n "$DB_PASSWORD" ]]         || DB_PASSWORD="$(gen_pw)"
 [[ -n "$GLPI_ADMIN_PASSWORD" ]] || GLPI_ADMIN_PASSWORD="$(gen_pw)"
@@ -213,16 +288,49 @@ EOF
 systemctl enable --now mariadb
 systemctl restart mariadb
 
+# >>> root-access
+# 判斷如何以 root 連上 MariaDB。依序嘗試:
+#   1. unix_socket,並忽略 ~/.my.cnf (全新安裝的預設情況;也能避開過期的 my.cnf 密碼)
+#   2. 以 DB_ROOT_PASSWORD 登入 (root 先前已被設為密碼登入)
+#   3. 沿用 ~/.my.cnf / 環境變數中既有的認證
+ROOT_MODE=""
+detect_root_access() {
+    if mariadb --no-defaults -uroot -e "SELECT 1" >/dev/null 2>&1; then
+        ROOT_MODE="socket"
+    elif [[ -n "$DB_ROOT_PASSWORD" ]] && MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb --no-defaults -uroot -e "SELECT 1" >/dev/null 2>&1; then
+        ROOT_MODE="password"
+    elif mariadb -e "SELECT 1" >/dev/null 2>&1; then
+        ROOT_MODE="defaults"
+    else
+        die "無法以 root 連上 MariaDB。這台主機的 MariaDB 先前已被設定過。
+       請擇一處理後重新執行:
+         a) 若知道 root 密碼:  DB_ROOT_PASSWORD='你的密碼' 再執行本腳本
+         b) 若忘記密碼:        參考說明改回 unix_socket 驗證,或在無重要資料時移除 MariaDB 後重裝"
+    fi
+    log "MariaDB root 連線方式: ${ROOT_MODE}"
+}
+rootdb() {
+    case "$ROOT_MODE" in
+        socket)   mariadb --no-defaults -uroot "$@" ;;
+        password) MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb --no-defaults -uroot "$@" ;;
+        defaults) mariadb "$@" ;;
+        *)        die "rootdb 在 detect_root_access 之前被呼叫" ;;
+    esac
+}
+# <<< root-access
+
+detect_root_access
+
 # --- 載入時區表 (GLPI 建議) ---
 TZ_TOOL="$(command -v mariadb-tzinfo-to-sql || command -v mysql_tzinfo_to_sql || true)"
 if [[ -n "$TZ_TOOL" ]]; then
-    "$TZ_TOOL" /usr/share/zoneinfo 2>/dev/null | mariadb mysql || warn "時區表載入有警告 (通常可忽略)"
+    "$TZ_TOOL" /usr/share/zoneinfo 2>/dev/null | rootdb mysql || warn "時區表載入有警告 (通常可忽略)"
 else
     warn "找不到 mariadb-tzinfo-to-sql,略過時區表"
 fi
 
-# --- 建立資料庫與使用者 (root 走 unix_socket,不需要密碼) ---
-mariadb <<SQL
+# --- 建立資料庫與使用者 ---
+rootdb <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
 ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
@@ -233,7 +341,7 @@ FLUSH PRIVILEGES;
 SQL
 
 # 驗證應用程式帳號可以登入
-mariadb -u"$DB_USER" -p"$DB_PASSWORD" -h localhost "$DB_NAME" -e "SELECT 1;" >/dev/null \
+mariadb --no-defaults -u"$DB_USER" -p"$DB_PASSWORD" -h localhost "$DB_NAME" -e "SELECT 1;" >/dev/null \
     || die "資料庫帳號 ${DB_USER} 登入失敗"
 log "✓ MariaDB 就緒 (buffer pool ${BP_MB}M)"
 
@@ -319,6 +427,8 @@ cat > /etc/logrotate.d/php-fpm-glpi <<'EOF'
 }
 EOF
 
+[[ -x "$PHP_BIN" ]] || die "找不到 $PHP_BIN,PHP ${PHP_VER} 安裝失敗"
+log "使用 PHP: $("$PHP_BIN" -r 'echo PHP_VERSION;') ($PHP_BIN);系統預設 php 指向: $(readlink -f "$(command -v php 2>/dev/null || echo /dev/null)")"
 php-fpm${PHP_VER} -t
 systemctl enable --now "php${PHP_VER}-fpm"
 systemctl restart "php${PHP_VER}-fpm"
@@ -329,7 +439,38 @@ log "✓ PHP-FPM 就緒 (max_children=${MAX_CH})"
 step "5/10 安裝並設定 Nginx"
 ###############################################################################
 apt_install nginx >/dev/null
-systemctl enable nginx
+systemctl enable --now nginx
+log "Nginx 版本: $(nginx -v 2>&1 | sed 's#.*/##')"
+
+# (a) Nginx 必須以 www-data 執行,才能讀取 PHP-FPM socket (www-data:www-data 0660)。
+#     Ubuntu 內建版預設就是 www-data;nginx.org 版預設是 nginx,需要改掉。
+NGINX_USER="$(awk '$1=="user"{gsub(/;/,"",$2); print $2; exit}' /etc/nginx/nginx.conf)"
+if [[ "${NGINX_USER:-}" != "www-data" ]]; then
+    warn "Nginx 以 '${NGINX_USER:-未設定}' 身分執行,改為 www-data 以便存取 PHP-FPM socket"
+    if grep -Eq '^[[:space:]]*user[[:space:]]+[^;]+;' /etc/nginx/nginx.conf; then
+        sed -i -E '0,/^[[:space:]]*user[[:space:]]+[^;]+;/s//user www-data;/' /etc/nginx/nginx.conf
+    else
+        sed -i '1i user www-data;' /etc/nginx/nginx.conf
+    fi
+    systemctl restart nginx    # user 變更需要重啟才會確實套用
+fi
+
+# (b) 判斷站台設定該放哪裡:
+#     Ubuntu 內建版會載入 sites-enabled/;nginx.org 版只載入 conf.d/*.conf,
+#     若照 sites-enabled 放,設定會被完全忽略 (443 不會出現)。
+if grep -Eq 'include[[:space:]]+/etc/nginx/sites-enabled/' /etc/nginx/nginx.conf; then
+    SITE_MODE="sites-enabled"
+    SITE_FILE="/etc/nginx/sites-available/glpi"
+else
+    SITE_MODE="conf.d"
+    SITE_FILE="/etc/nginx/conf.d/glpi.conf"
+    warn "nginx.conf 不載入 sites-enabled (可能是 nginx.org 版本),站台設定改寫入 ${SITE_FILE}"
+    # 停用預設歡迎頁,避免它佔用 80 port 的 default_server
+    [[ -f /etc/nginx/conf.d/default.conf ]] && mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled
+    # 清掉先前腳本留下、但不會被載入的連結
+    rm -f /etc/nginx/sites-enabled/glpi
+fi
+log "Nginx 站台設定模式: ${SITE_MODE} (${SITE_FILE})"
 
 mkdir -p /var/www/letsencrypt /etc/nginx/snippets
 
@@ -377,7 +518,7 @@ write_nginx_site() {
 
     if [[ "$mode" == "http" ]]; then
         # 純 HTTP: 申請憑證前的暫時設定,或 TLS_MODE=none 的正式設定
-        cat > /etc/nginx/sites-available/glpi <<'EOF'
+        cat > "$SITE_FILE" <<'EOF'
 server {
     listen 80;
     listen [::]:80;
@@ -395,7 +536,7 @@ server {
 }
 EOF
     else
-        cat > /etc/nginx/sites-available/glpi <<'EOF'
+        cat > "$SITE_FILE" <<'EOF'
 server {
     listen 80;
     listen [::]:80;
@@ -412,10 +553,11 @@ server {
 }
 
 server {
-    # Ubuntu 24.04 的 Nginx 為 1.24,使用 "listen ... http2" 寫法
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    # nginx >= 1.25.1 使用獨立的 http2 指令,舊版則寫在 listen 後面 (由腳本依版本代換)
+    listen 443 ssl@HTTP2_LISTEN@;
+    listen [::]:443 ssl@HTTP2_LISTEN@;
     server_name @DOMAIN@;
+    @HTTP2_DIRECTIVE@
 
     ssl_certificate     @CERT@;
     ssl_certificate_key @KEY@;
@@ -435,15 +577,23 @@ server {
 }
 EOF
     fi
-    sed -i "s#@DOMAIN@#${DOMAIN}#g; s#@CERT@#${cert:-}#g; s#@KEY@#${key:-}#g" /etc/nginx/sites-available/glpi
-    ln -sf /etc/nginx/sites-available/glpi /etc/nginx/sites-enabled/glpi
-    rm -f /etc/nginx/sites-enabled/default
+    local ngx_ver h2l h2d
+    ngx_ver="$(nginx -v 2>&1 | sed -E 's#.*/([0-9.]+).*#\1#')"
+    if dpkg --compare-versions "${ngx_ver:-0}" ge 1.25.1; then
+        h2l=""; h2d="http2 on;"
+    else
+        h2l=" http2"; h2d=""
+    fi
+    sed -i "s#@DOMAIN@#${DOMAIN}#g; s#@CERT@#${cert:-}#g; s#@KEY@#${key:-}#g; s#@HTTP2_LISTEN@#${h2l}#g; s#@HTTP2_DIRECTIVE@#${h2d}#g" "$SITE_FILE"
+    if [[ "$SITE_MODE" == "sites-enabled" ]]; then
+        ln -sf "$SITE_FILE" /etc/nginx/sites-enabled/glpi
+        rm -f /etc/nginx/sites-enabled/default
+    fi
     nginx -t
     systemctl reload nginx 2>/dev/null || systemctl restart nginx
 }
 
 write_nginx_site http
-systemctl restart nginx
 log "✓ Nginx (HTTP) 就緒"
 
 ###############################################################################
@@ -463,6 +613,14 @@ case "$TLS_MODE" in
         ;;
     selfsigned)
         mkdir -p /etc/ssl/glpi
+        # 既有憑證的 SAN 若不含目前的 DOMAIN (例如先前輸入錯誤的 IP),就重新產生
+        if [[ -f /etc/ssl/glpi/glpi.crt ]] \
+           && ! openssl x509 -in /etc/ssl/glpi/glpi.crt -noout -ext subjectAltName 2>/dev/null \
+                | grep -qE "(IP Address|DNS):${DOMAIN//./\\.}([,[:space:]]|$)"; then
+            warn "既有自簽憑證與 ${DOMAIN} 不符,舊憑證改名為 .old 並重新產生"
+            mv /etc/ssl/glpi/glpi.crt "/etc/ssl/glpi/glpi.crt.old.$(date +%s)"
+            mv /etc/ssl/glpi/glpi.key "/etc/ssl/glpi/glpi.key.old.$(date +%s)" 2>/dev/null || true
+        fi
         if [[ ! -f /etc/ssl/glpi/glpi.crt ]]; then
             if is_ip "$DOMAIN"; then SAN="IP:${DOMAIN}"; else SAN="DNS:${DOMAIN}"; fi
             openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 825 \
@@ -554,14 +712,23 @@ step "8/10 GLPI 需求檢查與資料庫初始化"
 cd "$GLPI_HOME"
 
 log "檢查 GLPI 需求"
-as_www php bin/console system:check_requirements \
+as_www "$PHP_BIN" bin/console system:check_requirements \
     || die "GLPI 需求檢查未通過,請依上方訊息補齊 (例如缺少的 PHP 擴充),再重新執行腳本"
 
+FRESH_INSTALL=0
 if [[ -f "${CONFIG_DIR}/config_db.php" ]]; then
     warn "config_db.php 已存在,略過 db:install"
 else
+    FRESH_INSTALL=1
+    # db:install 使用 --force 會覆蓋既有資料表,所以資料庫內已有資料時先中止,避免誤刪
+    EXISTING_TABLES="$(rootdb -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}';" 2>/dev/null || echo 0)"
+    if [[ "${EXISTING_TABLES:-0}" -gt 0 && "$FORCE_DB_OVERWRITE" != "1" ]]; then
+        die "資料庫 '${DB_NAME}' 內已有 ${EXISTING_TABLES} 個資料表,執行 db:install 會將其清空。
+       - 若確定可以覆蓋 (例如之前失敗的安裝殘留): 加上 FORCE_DB_OVERWRITE=1 重新執行
+       - 若裡面有需要保留的資料: 請改用 DB_NAME=其他名稱 重新執行,或先備份"
+    fi
     log "執行 db:install (資料表建立約需 1-2 分鐘)"
-    as_www php bin/console db:install \
+    as_www "$PHP_BIN" bin/console db:install \
         --db-host=localhost \
         --db-name="$DB_NAME" \
         --db-user="$DB_USER" \
@@ -573,68 +740,108 @@ else
        若是目錄搬移 (RELOCATE_DIRS=1) 與此 GLPI 版本不相容,請清理後以 RELOCATE_DIRS=0 重跑"
 fi
 
-as_www php bin/console database:enable_timezones || warn "啟用時區支援失敗,可稍後手動執行: php bin/console database:enable_timezones"
+as_www "$PHP_BIN" bin/console database:enable_timezones || warn "啟用時區支援失敗,可稍後手動執行: ${PHP_BIN} bin/console database:enable_timezones"
 
 ###############################################################################
 step "9/10 安裝後設定 (帳號、庫存、排程、備份)"
 ###############################################################################
-# --- 預設帳號處理: 為 glpi 設定強密碼,其餘預設帳號停用並隨機化密碼 ---
-ADMIN_HASH="$(PW="$GLPI_ADMIN_PASSWORD" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
-if mariadb "$DB_NAME" <<SQL
+# 以下會直接改寫資料庫內容,只在「本次全新安裝」時執行,
+# 避免重跑腳本時覆蓋管理員已在介面中改過的密碼與設定。
+if [[ "$FRESH_INSTALL" == "1" ]]; then
+    # --- 預設帳號處理: 為 glpi 設定強密碼,其餘預設帳號停用並隨機化密碼 ---
+    ADMIN_HASH="$(PW="$GLPI_ADMIN_PASSWORD" "$PHP_BIN" -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
+    if rootdb "$DB_NAME" <<SQL
 UPDATE glpi_users SET password='${ADMIN_HASH}' WHERE name='glpi';
 UPDATE glpi_users SET is_active=0 WHERE name IN ('tech','normal','post-only');
 SQL
-then
-    for u in tech normal post-only; do
-        H="$(PW="$(gen_pw)" php -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
-        mariadb "$DB_NAME" -e "UPDATE glpi_users SET password='${H}' WHERE name='${u}';" || true
-    done
-    log "✓ 預設帳號已處理 (glpi 密碼見 ${CRED_FILE};tech / normal / post-only 已停用)"
-else
-    warn "預設帳號處理失敗,請登入後立即手動修改 glpi / tech / normal / post-only 的密碼 (預設與帳號同名)"
-fi
+    then
+        for u in tech normal post-only; do
+            H="$(PW="$(gen_pw)" "$PHP_BIN" -r 'echo password_hash(getenv("PW"), PASSWORD_DEFAULT);')"
+            rootdb "$DB_NAME" -e "UPDATE glpi_users SET password='${H}' WHERE name='${u}';" || true
+        done
+        log "✓ 預設帳號已處理 (glpi 密碼見 ${CRED_FILE};tech / normal / post-only 已停用)"
+    else
+        warn "預設帳號處理失敗,請登入後立即手動修改 glpi / tech / normal / post-only 的密碼 (預設與帳號同名)"
+    fi
 
-# --- 啟用庫存功能 (否則 GLPI Agent 傳來的資料會被拒收) 與 URL ---
-mariadb "$DB_NAME" <<SQL || warn "寫入設定失敗,請在介面中確認「管理 > 庫存 > 啟用庫存」"
+    # --- 啟用庫存功能 (否則 GLPI Agent 傳來的資料會被拒收) 與 URL ---
+    rootdb "$DB_NAME" <<SQL || warn "寫入設定失敗,請在介面中確認「管理 > 庫存 > 啟用庫存」"
 INSERT INTO glpi_configs (context, name, value) VALUES ('inventory','enable_inventory','1')
-  ON DUPLICATE KEY UPDATE value='1';
+ON DUPLICATE KEY UPDATE value='1';
 INSERT INTO glpi_configs (context, name, value) VALUES ('core','url_base','${SCHEME}://${DOMAIN}')
-  ON DUPLICATE KEY UPDATE value='${SCHEME}://${DOMAIN}';
+ON DUPLICATE KEY UPDATE value='${SCHEME}://${DOMAIN}';
 SQL
-log "✓ 已啟用庫存功能並設定 URL: ${SCHEME}://${DOMAIN}"
+    log "✓ 已啟用庫存功能並設定 URL: ${SCHEME}://${DOMAIN}"
+
+else
+    warn "非全新安裝,略過預設帳號處理與資料庫設定寫入 (保留既有設定)"
+    CUR_URL="$(rootdb -N "$DB_NAME" -e "SELECT value FROM glpi_configs WHERE context='core' AND name='url_base';" 2>/dev/null || true)"
+    if [[ "$CUR_URL" != "${SCHEME}://${DOMAIN}" ]]; then
+        warn "GLPI 目前的 url_base 是 '${CUR_URL:-未設定}',與這次的 ${SCHEME}://${DOMAIN} 不同。"
+        warn "若 ${SCHEME}://${DOMAIN} 才是正確位址,請執行:"
+        warn "  mariadb -uroot -p ${DB_NAME} -e \"UPDATE glpi_configs SET value='${SCHEME}://${DOMAIN}' WHERE context='core' AND name='url_base';\""
+    fi
+fi
 
 # --- 排程 (GLPI 自動動作) ---
 if [[ -f "${GLPI_HOME}/front/cron.php" ]]; then
-    CRON_CMD="/usr/bin/php ${GLPI_HOME}/front/cron.php"
+    CRON_CMD="${PHP_BIN} ${GLPI_HOME}/front/cron.php"
 else
-    CRON_CMD="/usr/bin/php ${GLPI_HOME}/bin/console glpi:cron"
+    CRON_CMD="${PHP_BIN} ${GLPI_HOME}/bin/console glpi:cron"
 fi
 echo "* * * * * www-data ${CRON_CMD} >/dev/null 2>&1" > /etc/cron.d/glpi
 chmod 644 /etc/cron.d/glpi
 # 將自動動作切換為 CLI 模式 (mode 2),由系統 cron 執行
-mariadb "$DB_NAME" -e "UPDATE glpi_crontasks SET mode=2 WHERE mode=1;" \
-    || warn "切換自動動作為 CLI 模式失敗,請在「設定 > 自動動作」手動調整"
+if [[ "$FRESH_INSTALL" == "1" ]]; then
+    rootdb "$DB_NAME" -e "UPDATE glpi_crontasks SET mode=2 WHERE mode=1;" \
+        || warn "切換自動動作為 CLI 模式失敗,請在「設定 > 自動動作」手動調整"
+fi
 log "✓ 已建立 /etc/cron.d/glpi"
 
 # --- 每日備份 ---
 if [[ "$INSTALL_BACKUP" == "1" ]]; then
     mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+    # 備份使用 glpi 應用程式帳號,避免依賴 root 的驗證方式 (socket 或密碼皆可)
+    umask 077
+    cat > /root/.glpi-backup.cnf <<EOF
+[client]
+user=${DB_USER}
+password=${DB_PASSWORD}
+default-character-set=utf8mb4
+EOF
+    umask 022
     cat > /usr/local/sbin/glpi-backup.sh <<'EOF'
 #!/usr/bin/env bash
 # 每日備份 GLPI 資料庫與設定/檔案,保留 14 天。
 # 注意: 備份放在同一台主機不算真正的備份,請另外同步到其他主機或儲存空間。
+# 備份先寫成 .partial,驗證通過才改名;任何一步失敗都會清掉殘檔,
+# 避免留下「看起來像備份、其實是空的」檔案。
 set -euo pipefail
+umask 077
+
 BACKUP_DIR="@BACKUP_DIR@"
 DATE="$(date +%Y%m%d_%H%M%S)"
 DUMP="$(command -v mariadb-dump || command -v mysqldump)"
+DB_OUT="${BACKUP_DIR}/glpi-db-${DATE}.sql.gz"
+FILES_OUT="${BACKUP_DIR}/glpi-files-${DATE}.tar.gz"
+trap 'rm -f "${DB_OUT}.partial" "${FILES_OUT}.partial"' EXIT
 
-"$DUMP" --single-transaction --quick --routines --events "@DB_NAME@" | gzip > "${BACKUP_DIR}/glpi-db-${DATE}.sql.gz"
-tar -czf "${BACKUP_DIR}/glpi-files-${DATE}.tar.gz" \
+# 用 --defaults-file (只讀這一個檔案),不能用 --defaults-extra-file:
+# 後者排在 ~/.my.cnf 之前讀取,會被 /root/.my.cnf 裡過期的 root 認證蓋掉
+"$DUMP" --defaults-file=/root/.glpi-backup.cnf --single-transaction --quick --routines --events "@DB_NAME@" \
+    | gzip > "${DB_OUT}.partial"
+gzip -t "${DB_OUT}.partial"
+[[ "$(stat -c%s "${DB_OUT}.partial")" -gt 1000 ]] || { echo "資料庫備份異常偏小,視為失敗" >&2; exit 1; }
+mv "${DB_OUT}.partial" "$DB_OUT"
+
+tar -czf "${FILES_OUT}.partial" \
     --exclude='*/_cache' --exclude='*/_sessions' --exclude='*/_tmp' \
-    "@CONFIG_DIR@" "@VAR_DIR@" /etc/nginx/sites-available/glpi /etc/nginx/snippets/glpi-app.conf
+    "@CONFIG_DIR@" "@VAR_DIR@" @SITE_FILE@ /etc/nginx/snippets/glpi-app.conf
+mv "${FILES_OUT}.partial" "$FILES_OUT"
+
 find "$BACKUP_DIR" -type f -mtime +14 -delete
 EOF
-    sed -i "s#@BACKUP_DIR@#${BACKUP_DIR}#g; s#@DB_NAME@#${DB_NAME}#g; s#@CONFIG_DIR@#${CONFIG_DIR}#g; s#@VAR_DIR@#${VAR_DIR}#g" /usr/local/sbin/glpi-backup.sh
+    sed -i "s#@BACKUP_DIR@#${BACKUP_DIR}#g; s#@DB_NAME@#${DB_NAME}#g; s#@CONFIG_DIR@#${CONFIG_DIR}#g; s#@VAR_DIR@#${VAR_DIR}#g; s#@SITE_FILE@#${SITE_FILE}#g" /usr/local/sbin/glpi-backup.sh
     chmod 700 /usr/local/sbin/glpi-backup.sh
     echo "30 2 * * * root /usr/local/sbin/glpi-backup.sh >/dev/null 2>&1" > /etc/cron.d/glpi-backup
     chmod 644 /etc/cron.d/glpi-backup
@@ -644,15 +851,57 @@ fi
 ###############################################################################
 step "10/10 最終驗證"
 ###############################################################################
+# 主要套件的版本與實際來源 (apt-cache policy 中 *** 標記的那一組)
+pkg_report() {
+    local p pol src
+    for p in "$@"; do
+        pol="$(apt-cache policy "$p" 2>/dev/null || true)"
+        src="$(awk '/^ \*\*\*/{f=1;next} f&&/^ +[0-9]+ +(http|https|\/)/{print $2; exit} f&&/^ +[0-9]+ /{next} f&&!/^ +[0-9]+ /{exit}' <<<"$pol")"
+        log "套件來源  ${p}: $(dpkg-query -W -f='${Version}' "$p" 2>/dev/null || echo '?')  ←  ${src:-?}"
+    done
+}
+pkg_report nginx "php${PHP_VER}-fpm" mariadb-server
+
 for svc in nginx "php${PHP_VER}-fpm" mariadb; do
     systemctl is-active --quiet "$svc" && log "✓ $svc 運行中" || warn "✗ $svc 未運行"
 done
 
-HTTP_CODE="$(curl -ksS -o /dev/null -w '%{http_code}' -H "Host: ${DOMAIN}" "${SCHEME}://127.0.0.1/" || echo 000)"
+probe_web() {
+    # curl 失敗時 -w 仍會輸出 000,所以這裡用 || true,避免重複附加造成 "000000"
+    curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 \
+        -H "Host: ${DOMAIN}" "${SCHEME}://127.0.0.1/" 2>/dev/null || true
+}
+HTTP_CODE="$(probe_web)"; HTTP_CODE="${HTTP_CODE:-000}"
+
+# 000 = 連線被拒或逾時,常見原因是 Nginx 先前的 reload 沒有套用新設定,先完整重啟再驗證一次
+if [[ "$HTTP_CODE" == "000" ]]; then
+    warn "${SCHEME}://127.0.0.1 連線失敗,嘗試完整重啟 Nginx 後再驗證"
+    systemctl restart nginx || true
+    sleep 2
+    HTTP_CODE="$(probe_web)"; HTTP_CODE="${HTTP_CODE:-000}"
+    [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]] \
+        && warn "重啟後恢復正常:表示先前 reload 沒有套用新設定,建議查看 journalctl -u nginx 找原因"
+fi
+
 if [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]]; then
     log "✓ GLPI 網頁回應 HTTP ${HTTP_CODE}"
 else
-    warn "GLPI 網頁回應 HTTP ${HTTP_CODE},請檢查: tail -50 /var/log/nginx/glpi_error.log  /  ${LOG_DIR}/php-errors.log"
+    warn "GLPI 網頁回應 HTTP ${HTTP_CODE}。以下是自動收集的診斷資訊:"
+    echo "--- curl 實際錯誤訊息 (000 可能是被拒絕、逾時或 TLS 失敗,看這裡才分得出來) ---"
+    curl -ksS -o /dev/null --max-time 15 -H "Host: ${DOMAIN}" "${SCHEME}://127.0.0.1/" 2>&1 || true
+    echo "--- 80/443 監聽狀態 ---"
+    ss -tlnp 2>/dev/null | grep -E ':(80|443)\b' || echo "(沒有任何程序在監聽 80/443)"
+    echo "--- Nginx 版本 / 執行身分 / include 設定 ---"
+    nginx -v 2>&1 || true
+    grep -nE '^[[:space:]]*(user|include)' /etc/nginx/nginx.conf 2>&1 || true
+    echo "--- nginx -t ---";                       nginx -t 2>&1 || true
+    echo "--- 已啟用的 Nginx 站台 ---";            ls -l /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>&1 || true
+    echo "--- nginx journal (最後 15 行) ---";     journalctl -u nginx -n 15 --no-pager 2>&1 || true
+    echo "--- /var/log/nginx/error.log (最後 15 行) ---"; tail -n 15 /var/log/nginx/error.log 2>&1 || true
+    echo "--- glpi_error.log (最後 15 行) ---";    tail -n 15 /var/log/nginx/glpi_error.log 2>&1 || true
+    echo "--- PHP-FPM socket 與 journal ---";      ls -l /run/php/ 2>&1 || true
+    journalctl -u "php${PHP_VER}-fpm" -n 10 --no-pager 2>&1 || true
+    echo "--- GLPI php-errors.log (最後 15 行) ---"; tail -n 15 "${LOG_DIR}/php-errors.log" 2>&1 || true
 fi
 
 cat <<EOF
