@@ -27,6 +27,7 @@
 #   ENABLE_UFW        1=設定並啟用 UFW 防火牆         (1)
 #   INSTALL_BACKUP    1=安裝每日備份排程              (1)
 #   FORCE_OS          1=略過 Ubuntu 24.04 檢查        (0)
+#   MARIADB_SOURCE    ubuntu=全新安裝時固定使用 Ubuntu 官方來源的 MariaDB;any=不限制 (ubuntu)
 #   DB_ROOT_PASSWORD  MariaDB root 密碼 (僅在 root 已被設定為密碼登入時才需要)
 #   FORCE_DB_OVERWRITE 1=允許覆蓋「已有資料表」的資料庫 (會清空該資料庫!) (0)
 #
@@ -52,6 +53,7 @@ RELOCATE_DIRS="${RELOCATE_DIRS:-1}"
 ENABLE_UFW="${ENABLE_UFW:-1}"
 INSTALL_BACKUP="${INSTALL_BACKUP:-1}"
 FORCE_OS="${FORCE_OS:-0}"
+MARIADB_SOURCE="${MARIADB_SOURCE:-ubuntu}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-}"
 FORCE_DB_OVERWRITE="${FORCE_DB_OVERWRITE:-0}"
 
@@ -189,7 +191,44 @@ fi
 ###############################################################################
 step "3/10 安裝並設定 MariaDB"
 ###############################################################################
-apt_install mariadb-server mariadb-client >/dev/null
+# >>> mariadb-source
+# 只裝 "mariadb-server" 並不保證來自 Ubuntu:系統上若還有第三方 MariaDB 來源 (例如舊指南加的),
+# 且版本比 Ubuntu 新,apt 會選第三方的。所以全新安裝時用 APT pin 固定為 Ubuntu 官方來源 (Origin: Ubuntu)。
+MARIADB_PIN="/etc/apt/preferences.d/99-glpi-mariadb-ubuntu"
+MARIADB_FRESH=0
+if dpkg -s mariadb-server >/dev/null 2>&1; then
+    # 已經裝過:不去變更它 (從第三方降回 Ubuntu 版是降版,有風險),只回報現況
+    _cur="$(dpkg-query -W -f='${Version}' mariadb-server 2>/dev/null || true)"
+    if [[ "$_cur" == *"+maria"* ]]; then
+        warn "已安裝的 MariaDB 是 MariaDB.org 版本 (${_cur}),不是 Ubuntu 內建版;為避免降版風險,腳本不會變更它"
+    else
+        log "MariaDB 已安裝: ${_cur}"
+    fi
+    apt_install mariadb-server mariadb-client >/dev/null
+else
+    MARIADB_FRESH=1
+    if [[ "$MARIADB_SOURCE" == "ubuntu" ]]; then
+        cat > "$MARIADB_PIN" <<'EOF'
+# 由 install_glpi12.sh 產生:MariaDB 相關套件只使用 Ubuntu 官方來源,
+# 即使之後系統上出現第三方來源 (例如 mariadb.org) 也不會被自動換過去。
+# 若日後想改用 MariaDB.org 的版本,請先刪除此檔。
+Package: mariadb-* libmariadb* mysql-common
+Pin: release o=Ubuntu
+Pin-Priority: 1001
+EOF
+        log "已設定 APT pin: MariaDB 套件固定使用 Ubuntu 官方來源 (${MARIADB_PIN})"
+    else
+        warn "MARIADB_SOURCE=${MARIADB_SOURCE}:不限制 MariaDB 套件來源"
+    fi
+    apt_install mariadb-server mariadb-client >/dev/null
+fi
+
+_ver="$(dpkg-query -W -f='${Version}' mariadb-server 2>/dev/null || true)"
+log "MariaDB 套件版本: ${_ver:-未知}"
+if [[ "$MARIADB_FRESH" == "1" && "$MARIADB_SOURCE" == "ubuntu" && "$_ver" == *"+maria"* ]]; then
+    die "裝到的是 MariaDB.org 版本 (${_ver}),不是 Ubuntu 官方來源。請檢查: apt-cache policy mariadb-server"
+fi
+# <<< mariadb-source
 
 # --- 讀取或產生密碼 (重複執行時沿用) ---
 # 可由環境變數帶入 (例如帳密檔已被刪除時:DB_PASSWORD=... 重跑);否則讀帳密檔,再不然才產生新的
@@ -812,6 +851,17 @@ fi
 ###############################################################################
 step "10/10 最終驗證"
 ###############################################################################
+# 主要套件的版本與實際來源 (apt-cache policy 中 *** 標記的那一組)
+pkg_report() {
+    local p pol src
+    for p in "$@"; do
+        pol="$(apt-cache policy "$p" 2>/dev/null || true)"
+        src="$(awk '/^ \*\*\*/{f=1;next} f&&/^ +[0-9]+ +(http|https|\/)/{print $2; exit} f&&/^ +[0-9]+ /{next} f&&!/^ +[0-9]+ /{exit}' <<<"$pol")"
+        log "套件來源  ${p}: $(dpkg-query -W -f='${Version}' "$p" 2>/dev/null || echo '?')  ←  ${src:-?}"
+    done
+}
+pkg_report nginx "php${PHP_VER}-fpm" mariadb-server
+
 for svc in nginx "php${PHP_VER}-fpm" mariadb; do
     systemctl is-active --quiet "$svc" && log "✓ $svc 運行中" || warn "✗ $svc 未運行"
 done
