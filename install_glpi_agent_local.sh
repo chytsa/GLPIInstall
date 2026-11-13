@@ -16,8 +16,8 @@
 #   CA_CERT_SRC      GLPI 伺服器憑證檔                (自動讀取 Nginx 的 ssl_certificate)
 #   SKIP_CA          1=不設定 ca-cert-file            (0)
 #   FORCE_REINSTALL  1=已安裝也重新執行安裝器          (0)
-#   AGENT_USER       GLPI 要求基本認證時,Agent 使用的登入名稱
-#   AGENT_PASSWORD   對應的密碼 (不給的話,在終端機執行時會提示輸入;密碼不可含 # 引號 空白)
+#   OAUTH_CLIENT_ID      GLPI 要求 OAuth 認證時,Agent 使用的 OAuth Client ID
+#   OAUTH_CLIENT_SECRET  對應的 Client Secret (不給的話,在終端機執行時會提示輸入;不可含 # 引號 空白)
 #
 # 重複執行是安全的:已安裝且版本相同時,只會重新套用設定並重新驗證。
 # 全部輸出會同時記錄在 /var/log/glpi-agent-install.log
@@ -32,8 +32,8 @@ AGENT_TAG="${AGENT_TAG:-GLPI-Server}"
 CA_CERT_SRC="${CA_CERT_SRC:-}"
 SKIP_CA="${SKIP_CA:-0}"
 FORCE_REINSTALL="${FORCE_REINSTALL:-0}"
-AGENT_USER="${AGENT_USER:-}"
-AGENT_PASSWORD="${AGENT_PASSWORD:-}"
+OAUTH_CLIENT_ID="${OAUTH_CLIENT_ID:-}"
+OAUTH_CLIENT_SECRET="${OAUTH_CLIENT_SECRET:-}"
 
 INSTALLER_URL="https://github.com/glpi-project/glpi-agent/releases/download/${AGENT_VERSION}/glpi-agent-${AGENT_VERSION}-linux-installer.pl"
 AGENT_CONF_DIR="/etc/glpi-agent/conf.d"
@@ -96,18 +96,18 @@ fi
 [[ "$SERVER_URL" =~ ^https?://[A-Za-z0-9._:-]+(/.*)?$ ]] || die "SERVER_URL 格式不合法: $SERVER_URL"
 SERVER_HOST="${SERVER_URL#*://}"; SERVER_HOST="${SERVER_HOST%%/*}"; SERVER_HOST="${SERVER_HOST%%:*}"
 
-# ---- Agent 基本認證帳密 (GLPI 設定了 auth_required=basic_auth 時需要) ----
-if [[ -n "$AGENT_USER" ]]; then
-    if [[ -z "$AGENT_PASSWORD" ]]; then
+# ---- Agent OAuth 認證 (GLPI 設定了 auth_required=oauth 時需要;GLPI 11+ 才支援) ----
+if [[ -n "$OAUTH_CLIENT_ID" ]]; then
+    if [[ -z "$OAUTH_CLIENT_SECRET" ]]; then
         if [[ -t 0 ]]; then
-            read -rsp "請輸入 ${AGENT_USER} 的密碼: " AGENT_PASSWORD; echo
+            read -rsp "請輸入 OAuth Client Secret (Client ID: ${OAUTH_CLIENT_ID}): " OAUTH_CLIENT_SECRET; echo
         else
-            die "已指定 AGENT_USER,但沒有 AGENT_PASSWORD,且目前不是互動式終端機"
+            die "已指定 OAUTH_CLIENT_ID,但沒有 OAUTH_CLIENT_SECRET,且目前不是互動式終端機"
         fi
     fi
-    # Agent 設定檔對 # 有特殊處理 (會被當成註解而截斷密碼),引號與空白也容易出問題
-    [[ "$AGENT_USER"     =~ ^[A-Za-z0-9._@-]+$ ]]   || die "AGENT_USER 只允許英數字與 . _ @ -"
-    [[ "$AGENT_PASSWORD" =~ ^[^#\"\'[:space:]]+$ ]] || die "AGENT_PASSWORD 不可含 # 引號 或空白 (Agent 設定檔無法正確處理),請在 GLPI 改用其他密碼"
+    # Agent 設定檔對 # 有特殊處理 (會被當成註解而截斷),引號與空白也容易出問題
+    [[ "$OAUTH_CLIENT_ID"     =~ ^[A-Za-z0-9._@-]+$ ]]   || die "OAUTH_CLIENT_ID 只允許英數字與 . _ @ -"
+    [[ "$OAUTH_CLIENT_SECRET" =~ ^[^#\"\'[:space:]]+$ ]] || die "OAUTH_CLIENT_SECRET 不可含 # 引號 或空白 (Agent 設定檔無法正確處理),請在 GLPI 重新產生 Client Secret"
 fi
 
 log "Agent 版本: ${AGENT_VERSION}"
@@ -178,18 +178,21 @@ case "$INV" in
 esac
 
 AUTH_REQ="$(glpi_sql "SELECT value FROM glpi_configs WHERE context='inventory' AND name='auth_required';")"
-AUTH_LOGIN="$(glpi_sql "SELECT value FROM glpi_configs WHERE context='inventory' AND name='basic_auth_login';")"
 case "$AUTH_REQ" in
-    basic_auth)
-        if [[ -n "$AGENT_USER" ]]; then
-            log "GLPI 要求 Agent 使用基本認證 (GLPI 端登入名稱: ${AUTH_LOGIN:-?}),將使用 AGENT_USER=${AGENT_USER}"
-            [[ "$AGENT_USER" == "$AUTH_LOGIN" ]] || warn "AGENT_USER (${AGENT_USER}) 與 GLPI 設定的登入名稱 (${AUTH_LOGIN:-?}) 不同,請確認"
+    oauth)
+        if [[ -n "$OAUTH_CLIENT_ID" ]]; then
+            log "GLPI 要求 Agent 使用 OAuth (Client credentials) 認證,將使用 OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}"
         else
-            warn "GLPI 要求 Agent 使用「基本認證」(GLPI 端登入名稱: ${AUTH_LOGIN:-?}),否則 Agent 會得到 401。"
-            warn "GLPI 的密碼是加密儲存、無法讀回。請在「管理 > 庫存」設定新的帳密,再以 AGENT_USER / AGENT_PASSWORD 提供給本腳本"
+            warn "GLPI 要求 Agent 使用「OAuth」認證,否則 Agent 會得到 401。"
+            warn "請在 GLPI「設定 > OAuth 用戶端 (OAuth Clients)」建立一組 Grants=Client credentials、Scope=inventory 的用戶端,"
+            warn "取得 Client ID / Client Secret 後,以 OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET 提供給本腳本"
         fi ;;
-    ""|none) [[ -z "$AGENT_USER" ]] || warn "GLPI 未要求認證,但你指定了 AGENT_USER;仍會寫入設定,通常不需要" ;;
-    *) warn "GLPI 的庫存認證方式為 '${AUTH_REQ}',本腳本只處理基本認證 (basic_auth),其他方式需手動設定 Agent" ;;
+    basic_auth)
+        warn "GLPI 目前仍設定為「基本認證」(basic_auth),本腳本已改為只處理 OAuth。"
+        warn "請到「管理 > 庫存」將 Agent Authentication 改為 OAuth - Client Credentials,再重新執行本腳本"
+        ;;
+    ""|none) [[ -z "$OAUTH_CLIENT_ID" ]] || warn "GLPI 未要求認證,但你指定了 OAUTH_CLIENT_ID;仍會寫入設定,通常不需要" ;;
+    *) warn "GLPI 的庫存認證方式為 '${AUTH_REQ}',本腳本只處理 OAuth (oauth),其他方式需手動設定 Agent" ;;
 esac
 
 ###############################################################################
@@ -249,23 +252,23 @@ else
     log "不需要 ca-cert-file 設定"
 fi
 
-if [[ -n "$AGENT_USER" ]]; then
+if [[ -n "$OAUTH_CLIENT_ID" ]]; then
     umask 077
     cat > "${AGENT_CONF_DIR}/30-glpi-auth.cfg" <<EOF
-# 由 install_glpi_agent_local.sh 產生 (含密碼,權限 600)
-user = ${AGENT_USER}
-password = ${AGENT_PASSWORD}
+# 由 install_glpi_agent_local.sh 產生 (含 Client Secret,權限 600)
+oauth-client-id = ${OAUTH_CLIENT_ID}
+oauth-client-secret = ${OAUTH_CLIENT_SECRET}
 EOF
     umask 022
     chown root:root "${AGENT_CONF_DIR}/30-glpi-auth.cfg"; chmod 600 "${AGENT_CONF_DIR}/30-glpi-auth.cfg"
-    log "✓ 已寫入基本認證帳密 (user = ${AGENT_USER},權限 600)"
+    log "✓ 已寫入 OAuth 認證設定 (oauth-client-id = ${OAUTH_CLIENT_ID},權限 600)"
 fi
 
 log "目前 conf.d 內容:"
 for f in "$AGENT_CONF_DIR"/*.cfg; do
     [[ -f "$f" ]] || continue
     echo "  --- $f"
-    grep -vE '^[[:space:]]*(#|$)' "$f" | sed -E 's/^([[:space:]]*password[[:space:]]*=).*/\1 ********/; s/^/      /' || true
+    grep -vE '^[[:space:]]*(#|$)' "$f" | sed -E 's/^([[:space:]]*(password|oauth-client-secret)[[:space:]]*=).*/\1 ********/; s/^/      /' || true
 done
 
 systemctl enable glpi-agent >/dev/null 2>&1 || true
@@ -309,7 +312,7 @@ if (( RC != 0 )) || grep -Eq '\[error\]' "$RUN_LOG"; then
     warn "  - certificate verify failed        → 憑證與網址主機名稱不符,或 ca-cert-file 沒有生效"
     warn "  - authentication required (401)     → 伺服器端要求認證,與憑證無關:可能是 Web 伺服器的認證設定,"
     warn "                                         或 GLPI 的庫存 Agent 認證設定,請看下方探測結果"
-    warn "                                         若 GLPI 的 auth_required 是 basic_auth,請用 AGENT_USER / AGENT_PASSWORD 重新執行本腳本"
+    warn "                                         若 GLPI 的 auth_required 是 oauth,請用 OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET 重新執行本腳本"
     warn "  - 403 / inventory disabled          → GLPI 尚未啟用庫存 (管理 > 庫存)"
     warn "  - 404                                → SERVER_URL 路徑不對 (可改試 https://主機/front/inventory.php)"
     diagnose_endpoint
