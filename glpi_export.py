@@ -1,4 +1,5 @@
 import re
+import time
 import requests
 import pandas as pd
 
@@ -40,9 +41,9 @@ def get_token():
     return r.json()["access_token"]
 
 
-def get_spec(headers):
+def get_spec(session, headers):
     """抓取整份 Swagger(OpenAPI) 規格,只需呼叫一次"""
-    r = requests.get(f"{API_BASE}/doc.json", headers=headers, verify=VERIFY_SSL)
+    r = session.get(f"{API_BASE}/doc.json", headers=headers, verify=VERIFY_SSL)
     if not r.ok:
         raise RuntimeError(f"{r.status_code} {r.text}")
     return r.json()
@@ -77,19 +78,22 @@ def discover_sub_resource_paths(main_path, spec):
     return subs
 
 
-def fetch_collection(url, headers):
+def fetch_collection(session, url, headers):
     """對單一清單端點做分頁抓取(start/limit),回傳所有筆數"""
     rows = []
     start = 0
     total = None
 
     while total is None or start < total:
-        r = requests.get(
+        r = session.get(
             url,
             headers=headers,
             params={"start": start, "limit": STEP},
             verify=VERIFY_SSL,
         )
+        if r.status_code == 404:
+            # 一對一關聯(如 Infocom)在未填寫資料時,GLPI 回 404 屬正常現象,安靜跳過即可
+            break
         if r.status_code not in (200, 206):
             print(f"  查詢失敗: {url} -> {r.status_code} {r.text}")
             break
@@ -124,7 +128,30 @@ def sheet_name_from_path(item_name, main_path, sub_path):
     return name[:31] if name else item_name[:31]
 
 
-def export_itemtype(item_name, headers, spec):
+def print_progress_bar(current, total, prefix="", bar_length=40):
+    """印出單行水平進度條(0%~100%),用 \\r 覆寫同一行"""
+    if total <= 0:
+        return
+    fraction = min(current / total, 1.0)
+    filled = int(bar_length * fraction)
+    bar = "#" * filled + "-" * (bar_length - filled)
+    end = "\n" if current >= total else ""
+    print(f"\r{prefix} |{bar}| {fraction * 100:5.1f}% ({current}/{total})", end=end, flush=True)
+
+
+def format_duration(seconds):
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(int(minutes), 60)
+    if hours:
+        return f"{hours}h{minutes}m{secs:.1f}s"
+    if minutes:
+        return f"{minutes}m{secs:.1f}s"
+    return f"{secs:.2f}s"
+
+
+def export_itemtype(item_name, headers, spec, session):
+    item_start = time.perf_counter()
+
     try:
         main_path = discover_collection_path(item_name, spec)
     except Exception as e:
@@ -133,8 +160,10 @@ def export_itemtype(item_name, headers, spec):
 
     main_url = f"{API_BASE}{main_path}"
     print(f"[{item_name}] 使用端點: {main_url}")
-    main_rows = fetch_collection(main_url, headers)
-    print(f"[{item_name}] 主要資料已取得 {len(main_rows)} 筆")
+    main_start = time.perf_counter()
+    main_rows = fetch_collection(session, main_url, headers)
+    main_elapsed = time.perf_counter() - main_start
+    print(f"[{item_name}] 主要資料已取得 {len(main_rows)} 筆 (耗時 {format_duration(main_elapsed)})")
 
     sheets = {}
     sheets[item_name] = (
@@ -142,43 +171,54 @@ def export_itemtype(item_name, headers, spec):
     )
 
     if not EXPORT_SUB_RESOURCES or not main_rows:
+        total_elapsed = time.perf_counter() - item_start
+        print(f"[{item_name}] 全部完成 (總耗時 {format_duration(total_elapsed)})")
         return sheets
 
     sub_paths = discover_sub_resource_paths(main_path, spec)
     print(f"[{item_name}] 找到 {len(sub_paths)} 個子資源端點: {sub_paths}")
 
+    total_parents = len(main_rows)
     for sub_path in sub_paths:
         sheet_name = sheet_name_from_path(item_name, main_path, sub_path)
         combined_rows = []
-        for parent in main_rows:
+        sub_start = time.perf_counter()
+        print_progress_bar(0, total_parents, prefix=f"  [{sheet_name}]")
+        for idx, parent in enumerate(main_rows, start=1):
             parent_id = parent.get("id")
-            if parent_id is None:
-                continue
-            url = f"{API_BASE}{re.sub(r'{[^/]+}', str(parent_id), sub_path, count=1)}"
-            rows = fetch_collection(url, headers)
-            for row in rows:
-                if isinstance(row, dict):
-                    row[f"{item_name}.id"] = parent_id
-            combined_rows.extend(rows)
+            if parent_id is not None:
+                url = f"{API_BASE}{re.sub(r'{[^/]+}', str(parent_id), sub_path, count=1)}"
+                rows = fetch_collection(session, url, headers)
+                for row in rows:
+                    if isinstance(row, dict):
+                        row[f"{item_name}.id"] = parent_id
+                combined_rows.extend(rows)
 
-        print(f"  [{sheet_name}] 共 {len(combined_rows)} 筆")
+            print_progress_bar(idx, total_parents, prefix=f"  [{sheet_name}]")
+
+        sub_elapsed = time.perf_counter() - sub_start
+        print(f"  [{sheet_name}] 共 {len(combined_rows)} 筆 (耗時 {format_duration(sub_elapsed)})")
         sheets[sheet_name] = (
             pd.json_normalize(combined_rows, sep=".")
             if combined_rows
             else pd.DataFrame()
         )
 
+    total_elapsed = time.perf_counter() - item_start
+    print(f"[{item_name}] 全部完成 (總耗時 {format_duration(total_elapsed)})")
     return sheets
+
 
 
 def main():
     token = get_token()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    spec = get_spec(headers)
+    with requests.Session() as session:
+        spec = get_spec(session, headers)
 
-    all_sheets = {}
-    for item_name in ITEM_NAMES:
-        all_sheets.update(export_itemtype(item_name, headers, spec))
+        all_sheets = {}
+        for item_name in ITEM_NAMES:
+            all_sheets.update(export_itemtype(item_name, headers, spec, session))
 
     # 若全部都沒資料,openpyxl 無法儲存沒有任何可見工作表的活頁簿,
     # 因此至少保留空白的工作表,避免 "At least one sheet must be visible" 錯誤
