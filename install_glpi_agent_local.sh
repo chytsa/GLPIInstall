@@ -13,9 +13,11 @@
 #   AGENT_VERSION    Agent 版本                       (1.21,請先到 GitHub releases 確認最新版)
 #   SERVER_URL       GLPI 網址                        (自動從 Nginx 設定偵測)
 #   AGENT_TAG        寫入清單的標籤                   (GLPI-Server)
-#   CA_CERT_SRC      GLPI 伺服器憑證檔                (/etc/ssl/glpi/glpi.crt)
+#   CA_CERT_SRC      GLPI 伺服器憑證檔                (自動讀取 Nginx 的 ssl_certificate)
 #   SKIP_CA          1=不設定 ca-cert-file            (0)
 #   FORCE_REINSTALL  1=已安裝也重新執行安裝器          (0)
+#   AGENT_USER       GLPI 要求基本認證時,Agent 使用的登入名稱
+#   AGENT_PASSWORD   對應的密碼 (不給的話,在終端機執行時會提示輸入;密碼不可含 # 引號 空白)
 #
 # 重複執行是安全的:已安裝且版本相同時,只會重新套用設定並重新驗證。
 # 全部輸出會同時記錄在 /var/log/glpi-agent-install.log
@@ -27,9 +29,11 @@ SCRIPT_VERSION="1 (2026-11-11)"
 AGENT_VERSION="${AGENT_VERSION:-1.21}"
 SERVER_URL="${SERVER_URL:-}"
 AGENT_TAG="${AGENT_TAG:-GLPI-Server}"
-CA_CERT_SRC="${CA_CERT_SRC:-/etc/ssl/glpi/glpi.crt}"
+CA_CERT_SRC="${CA_CERT_SRC:-}"
 SKIP_CA="${SKIP_CA:-0}"
 FORCE_REINSTALL="${FORCE_REINSTALL:-0}"
+AGENT_USER="${AGENT_USER:-}"
+AGENT_PASSWORD="${AGENT_PASSWORD:-}"
 
 INSTALLER_URL="https://github.com/glpi-project/glpi-agent/releases/download/${AGENT_VERSION}/glpi-agent-${AGENT_VERSION}-linux-installer.pl"
 AGENT_CONF_DIR="/etc/glpi-agent/conf.d"
@@ -92,6 +96,20 @@ fi
 [[ "$SERVER_URL" =~ ^https?://[A-Za-z0-9._:-]+(/.*)?$ ]] || die "SERVER_URL 格式不合法: $SERVER_URL"
 SERVER_HOST="${SERVER_URL#*://}"; SERVER_HOST="${SERVER_HOST%%/*}"; SERVER_HOST="${SERVER_HOST%%:*}"
 
+# ---- Agent 基本認證帳密 (GLPI 設定了 auth_required=basic_auth 時需要) ----
+if [[ -n "$AGENT_USER" ]]; then
+    if [[ -z "$AGENT_PASSWORD" ]]; then
+        if [[ -t 0 ]]; then
+            read -rsp "請輸入 ${AGENT_USER} 的密碼: " AGENT_PASSWORD; echo
+        else
+            die "已指定 AGENT_USER,但沒有 AGENT_PASSWORD,且目前不是互動式終端機"
+        fi
+    fi
+    # Agent 設定檔對 # 有特殊處理 (會被當成註解而截斷密碼),引號與空白也容易出問題
+    [[ "$AGENT_USER"     =~ ^[A-Za-z0-9._@-]+$ ]]   || die "AGENT_USER 只允許英數字與 . _ @ -"
+    [[ "$AGENT_PASSWORD" =~ ^[^#\"\'[:space:]]+$ ]] || die "AGENT_PASSWORD 不可含 # 引號 或空白 (Agent 設定檔無法正確處理),請在 GLPI 改用其他密碼"
+fi
+
 log "Agent 版本: ${AGENT_VERSION}"
 curl -fsIL "$INSTALLER_URL" -o /dev/null \
     || die "找不到安裝器: $INSTALLER_URL
@@ -102,6 +120,16 @@ step "2/7 驗證 GLPI 連線與憑證 (安裝前先確認,與 Agent 實際會遇
 ###############################################################################
 USE_CA=0
 CURL_CA=()
+# 預設以 Nginx 實際使用的憑證為準,避免檢查到和伺服器送出的不一致的檔案 (可用 CA_CERT_SRC= 覆寫)
+if [[ -z "$CA_CERT_SRC" ]]; then
+    CA_CERT_SRC="/etc/ssl/glpi/glpi.crt"
+    for f in /etc/nginx/conf.d/glpi.conf /etc/nginx/sites-available/glpi; do
+        [[ -f "$f" ]] || continue
+        _c="$(awk '/^[[:space:]]*ssl_certificate[[:space:]]/{gsub(/;/,"",$2); print $2; exit}' "$f")"
+        if [[ -n "$_c" && -f "$_c" ]]; then CA_CERT_SRC="$_c"; break; fi
+    done
+fi
+log "GLPI 伺服器憑證: ${CA_CERT_SRC}"
 if [[ "$SERVER_URL" == https://* && "$SKIP_CA" != "1" && -f "$CA_CERT_SRC" ]]; then
     # 只有「自簽憑證」才需要把它設為信任根;公開 CA 簽發的憑證不需要
     if [[ "$(openssl x509 -in "$CA_CERT_SRC" -noout -subject_hash 2>/dev/null)" == \
@@ -112,7 +140,15 @@ if [[ "$SERVER_URL" == https://* && "$SKIP_CA" != "1" && -f "$CA_CERT_SRC" ]]; t
         if ! openssl x509 -in "$CA_CERT_SRC" -noout -ext subjectAltName 2>/dev/null \
              | grep -qE "(IP Address|DNS):${SERVER_HOST//./\\.}([,[:space:]]|$)"; then
             warn "憑證的 SAN 不含 '${SERVER_HOST}',Agent 會因主機名稱不符而拒絕連線。"
-            warn "請改用憑證涵蓋的位址作為 SERVER_URL,或重新產生憑證 (可重跑 install_glpi12.sh)"
+            warn "目前憑證涵蓋的位址: $(openssl x509 -in "$CA_CERT_SRC" -noout -ext subjectAltName 2>/dev/null | tail -n1 | sed 's/^ *//')"
+            warn "請以下列指令重新產生憑證並重載 Nginx,再重新執行本腳本:"
+            if [[ "$SERVER_HOST" =~ ^[0-9.]+$ ]]; then _san="IP:${SERVER_HOST}"; else _san="DNS:${SERVER_HOST}"; fi
+            echo "    sudo mv ${CA_CERT_SRC} ${CA_CERT_SRC}.old"
+            echo "    sudo openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 825 \\"
+            echo "      -keyout <原金鑰路徑> -out ${CA_CERT_SRC} \\"
+            echo "      -subj \"/CN=${SERVER_HOST}\" -addext \"subjectAltName=${_san}\""
+            echo "    sudo nginx -t && sudo systemctl reload nginx"
+            warn "(金鑰路徑請見 Nginx 設定的 ssl_certificate_key;使用 install_glpi12.sh 建立的環境為 /etc/ssl/glpi/glpi.key)"
         fi
     else
         log "憑證不是自簽,視為公開 CA 簽發,不需設定 ca-cert-file"
@@ -139,6 +175,21 @@ case "$INV" in
     1) log "✓ GLPI 已啟用庫存功能" ;;
     0) warn "GLPI 的庫存功能是「停用」狀態,Agent 的資料會被拒收。請登入 GLPI,到「管理 > 庫存」勾選「啟用庫存」" ;;
     *) warn "無法從資料庫確認庫存設定,請登入 GLPI 檢查「管理 > 庫存」是否已啟用庫存" ;;
+esac
+
+AUTH_REQ="$(glpi_sql "SELECT value FROM glpi_configs WHERE context='inventory' AND name='auth_required';")"
+AUTH_LOGIN="$(glpi_sql "SELECT value FROM glpi_configs WHERE context='inventory' AND name='basic_auth_login';")"
+case "$AUTH_REQ" in
+    basic_auth)
+        if [[ -n "$AGENT_USER" ]]; then
+            log "GLPI 要求 Agent 使用基本認證 (GLPI 端登入名稱: ${AUTH_LOGIN:-?}),將使用 AGENT_USER=${AGENT_USER}"
+            [[ "$AGENT_USER" == "$AUTH_LOGIN" ]] || warn "AGENT_USER (${AGENT_USER}) 與 GLPI 設定的登入名稱 (${AUTH_LOGIN:-?}) 不同,請確認"
+        else
+            warn "GLPI 要求 Agent 使用「基本認證」(GLPI 端登入名稱: ${AUTH_LOGIN:-?}),否則 Agent 會得到 401。"
+            warn "GLPI 的密碼是加密儲存、無法讀回。請在「管理 > 庫存」設定新的帳密,再以 AGENT_USER / AGENT_PASSWORD 提供給本腳本"
+        fi ;;
+    ""|none) [[ -z "$AGENT_USER" ]] || warn "GLPI 未要求認證,但你指定了 AGENT_USER;仍會寫入設定,通常不需要" ;;
+    *) warn "GLPI 的庫存認證方式為 '${AUTH_REQ}',本腳本只處理基本認證 (basic_auth),其他方式需手動設定 Agent" ;;
 esac
 
 ###############################################################################
@@ -198,11 +249,23 @@ else
     log "不需要 ca-cert-file 設定"
 fi
 
+if [[ -n "$AGENT_USER" ]]; then
+    umask 077
+    cat > "${AGENT_CONF_DIR}/30-glpi-auth.cfg" <<EOF
+# 由 install_glpi_agent_local.sh 產生 (含密碼,權限 600)
+user = ${AGENT_USER}
+password = ${AGENT_PASSWORD}
+EOF
+    umask 022
+    chown root:root "${AGENT_CONF_DIR}/30-glpi-auth.cfg"; chmod 600 "${AGENT_CONF_DIR}/30-glpi-auth.cfg"
+    log "✓ 已寫入基本認證帳密 (user = ${AGENT_USER},權限 600)"
+fi
+
 log "目前 conf.d 內容:"
 for f in "$AGENT_CONF_DIR"/*.cfg; do
     [[ -f "$f" ]] || continue
     echo "  --- $f"
-    grep -vE '^[[:space:]]*(#|$)' "$f" | sed 's/^/      /' || true
+    grep -vE '^[[:space:]]*(#|$)' "$f" | sed -E 's/^([[:space:]]*password[[:space:]]*=).*/\1 ********/; s/^/      /' || true
 done
 
 systemctl enable glpi-agent >/dev/null 2>&1 || true
@@ -213,17 +276,43 @@ systemctl is-active --quiet glpi-agent && log "✓ glpi-agent 服務運行中" |
 ###############################################################################
 step "6/7 手動觸發一次庫存並回報到 GLPI"
 ###############################################################################
+# 失敗時自動收集端點資訊 (全部是唯讀的 GET 與查詢,沒有副作用)
+diagnose_endpoint() {
+    local u out
+    echo "--- 端點探測 (GET):看回應狀態與 WWW-Authenticate 標頭,可判斷是誰要求認證 ---"
+    for u in "$SERVER_URL" "${SERVER_URL%/}/front/inventory.php"; do
+        echo ">>> GET ${u}"
+        out="$(curl -sS "${CURL_CA[@]}" -i --max-time 20 "$u" 2>&1 || true)"
+        sed -n '1,14p' <<<"$out" | grep -viE '^(set-cookie|content-security|x-|permissions-policy|referrer)' | sed 's/^/      /' || true
+    done
+    echo "--- Nginx 記錄到的 Agent 請求 (最近 3 筆:狀態碼與路徑) ---"
+    grep -h 'GLPI-Agent' /var/log/nginx/glpi_access.log 2>/dev/null | tail -n 3 | sed 's/^/      /' || echo "      (沒有紀錄)"
+    echo "--- GLPI 資料庫中的庫存設定 (context=inventory) ---"
+    glpi_sql "SELECT CONCAT(name,' = ',IF(name LIKE '%password%' OR name LIKE '%secret%','********',IFNULL(value,''))) FROM glpi_configs WHERE context='inventory' ORDER BY name;" | sed 's/^/      /' || true
+    echo "--- GLPI 日誌目錄中最近更新的檔案 ---"
+    ls -lt /var/log/glpi 2>/dev/null | sed -n '1,6p' | sed 's/^/      /' || true
+}
+
 RUN_LOG="$(mktemp)"
 RC=0
 timeout 900 glpi-agent --force --logger=stderr >"$RUN_LOG" 2>&1 || RC=$?
 echo "--- Agent 輸出 (最後 25 行) ---"
 tail -n 25 "$RUN_LOG"
 echo "--- 結束碼: ${RC} ---"
-if (( RC != 0 )) || grep -Eqi 'certificate verify failed|unable to connect|SSL|error' "$RUN_LOG"; then
-    warn "Agent 輸出含有錯誤字樣,請看上方訊息。常見狀況:"
-    warn "  - certificate verify failed   → 憑證與網址主機名稱不符,或 ca-cert-file 沒有生效"
-    warn "  - 403 / inventory disabled    → GLPI 尚未啟用庫存 (管理 > 庫存)"
-    warn "  - 404                          → SERVER_URL 路徑不對 (可試 https://主機/front/inventory.php)"
+
+# 注意:Agent 即使回報失敗,結束碼也常常是 0,所以要看輸出中的 [error] 行來判斷
+AGENT_FAILED=0
+AGENT_UNCONFIRMED=0
+if (( RC != 0 )) || grep -Eq '\[error\]' "$RUN_LOG"; then
+    AGENT_FAILED=1
+    warn "Agent 回報失敗 (判斷依據是輸出中的 [error] 行,而不是結束碼)。常見狀況:"
+    warn "  - certificate verify failed        → 憑證與網址主機名稱不符,或 ca-cert-file 沒有生效"
+    warn "  - authentication required (401)     → 伺服器端要求認證,與憑證無關:可能是 Web 伺服器的認證設定,"
+    warn "                                         或 GLPI 的庫存 Agent 認證設定,請看下方探測結果"
+    warn "                                         若 GLPI 的 auth_required 是 basic_auth,請用 AGENT_USER / AGENT_PASSWORD 重新執行本腳本"
+    warn "  - 403 / inventory disabled          → GLPI 尚未啟用庫存 (管理 > 庫存)"
+    warn "  - 404                                → SERVER_URL 路徑不對 (可改試 https://主機/front/inventory.php)"
+    diagnose_endpoint
 fi
 rm -f "$RUN_LOG"
 
@@ -237,15 +326,24 @@ if [[ -n "$AGENT_ROWS" ]]; then
     log "✓ GLPI 的 Agent 清單 (最近 5 筆):"
     echo "$AGENT_ROWS" | sed 's/^/      /'
     log "GLPI 目前的電腦資產數: ${COMP_N:-?}"
+elif (( AGENT_FAILED == 0 )); then
+    AGENT_UNCONFIRMED=1
+    warn "Agent 沒有回報錯誤,但資料庫中還看不到任何 Agent。請稍候幾十秒後,在 GLPI 介面確認:「管理 > 庫存」或「資產 > 電腦」"
+fi
+
+if (( AGENT_FAILED )); then
+    BANNER_COLOR="$RED";    BANNER_TITLE="⚠ Agent 已安裝,但回報到 GLPI 失敗 (請看上方錯誤與探測結果)"
+elif (( AGENT_UNCONFIRMED )); then
+    BANNER_COLOR="$YELLOW"; BANNER_TITLE="⚠ Agent 已安裝並已送出,但尚未在 GLPI 資料庫看到資料"
 else
-    warn "資料庫中還看不到任何 Agent。請稍候幾十秒後,在 GLPI 介面確認:「管理 > 庫存」或「資產 > 電腦」"
+    BANNER_COLOR="$GREEN";  BANNER_TITLE="✅ GLPI Agent 本機部署完成,GLPI 已收到資料"
 fi
 
 cat <<EOF
 
-${GREEN}============================================================${NC}
- ✅ GLPI Agent 本機部署流程完成
-${GREEN}============================================================${NC}
+${BANNER_COLOR}============================================================${NC}
+ ${BANNER_TITLE}
+${BANNER_COLOR}============================================================${NC}
  Agent 版本 : $(glpi-agent --version 2>&1 | head -n1 || true)
  GLPI 網址  : ${SERVER_URL}
  設定目錄   : ${AGENT_CONF_DIR}  (請勿直接改 agent.cfg,升級時會遺失)
@@ -261,3 +359,6 @@ ${GREEN}============================================================${NC}
   - 之後要在其他電腦安裝 Agent,請使用同一個 SERVER_URL,並讓 Agent 信任 ${CA_CERT_SRC}
     (複製憑證檔過去,設定 ca-cert-file;或改用企業 CA / 公開 CA 簽發的憑證)。
 EOF
+
+# 失敗時回傳非 0,讓呼叫端 (例如自動化流程) 能察覺
+(( AGENT_FAILED == 0 )) || exit 1
