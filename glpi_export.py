@@ -210,6 +210,54 @@ def export_itemtype(item_name, headers, spec, session):
 
 
 
+def fetch_agents(session, headers, spec):
+    """
+    抓取 /Inventory/Agent 清單(一次抓全部,不需要逐筆帶 Computer id)。
+    每筆 Agent 記錄含 itemtype / items_id(對應回資產)與 remote_address
+    (agent 回報庫存時的來源 IP)。
+    """
+    try:
+        path = discover_collection_path("Agent", spec)
+    except Exception as e:
+        print(f"[Agent] 無法取得端點路徑: {e}")
+        return pd.DataFrame()
+
+    url = f"{API_BASE}{path}"
+    print(f"[Agent] 使用端點: {url}")
+    start_t = time.perf_counter()
+    rows = fetch_collection(session, url, headers)
+    elapsed = time.perf_counter() - start_t
+    print(f"[Agent] 已取得 {len(rows)} 筆 (耗時 {format_duration(elapsed)})")
+    return pd.json_normalize(rows, sep=".") if rows else pd.DataFrame()
+
+
+def merge_agent_ip_into_computer(all_sheets, agents_df):
+    """把 Agent 的 remote_address(來源 IP)依 itemtype/items_id 對應回 Computer 分頁"""
+    if "Computer" not in all_sheets or agents_df.empty:
+        return
+    if "itemtype" not in agents_df.columns or "items_id" not in agents_df.columns:
+        return
+
+    comp_agents = agents_df[agents_df["itemtype"] == "Computer"].copy()
+    if comp_agents.empty:
+        return
+
+    # 同一台電腦理論上只會有一個 Computer inventory agent,
+    # 若有多筆(例如重複註冊),保留最近一次回報(last_contact 最新)的那筆
+    if "last_contact" in comp_agents.columns:
+        comp_agents = comp_agents.sort_values("last_contact", ascending=False)
+    comp_agents = comp_agents.drop_duplicates(subset="items_id", keep="first")
+
+    keep_cols = {"items_id": "id"}
+    if "remote_address" in comp_agents.columns:
+        keep_cols["remote_address"] = "agent_remote_address"
+    if "last_contact" in comp_agents.columns:
+        keep_cols["last_contact"] = "agent_last_contact"
+
+    comp_agents = comp_agents[list(keep_cols.keys())].rename(columns=keep_cols)
+    all_sheets["Computer"] = all_sheets["Computer"].merge(comp_agents, on="id", how="left")
+
+
 def main():
     token = get_token()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -219,6 +267,10 @@ def main():
         all_sheets = {}
         for item_name in ITEM_NAMES:
             all_sheets.update(export_itemtype(item_name, headers, spec, session))
+
+        agents_df = fetch_agents(session, headers, spec)
+        all_sheets["Agent"] = agents_df
+        merge_agent_ip_into_computer(all_sheets, agents_df)
 
     # 若全部都沒資料,openpyxl 無法儲存沒有任何可見工作表的活頁簿,
     # 因此至少保留空白的工作表,避免 "At least one sheet must be visible" 錯誤
